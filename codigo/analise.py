@@ -238,7 +238,7 @@ def write_comparison(out, rows, title='Sumário dos casos', links=None, plot=Tru
     figures = out/'figuras'
     figures.mkdir(exist_ok=True)
     with (out/'sumario.csv').open('w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]), lineterminator='\n')
         writer.writeheader()
         writer.writerows(rows)
     def number(value):
