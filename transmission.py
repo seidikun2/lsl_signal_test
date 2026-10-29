@@ -1,12 +1,11 @@
 """Generate signals and markers, simulate acquisition and transmit over LSL."""
-import argparse
 import json
 import time
 from pathlib import Path
 
 import numpy as np
 from pylsl import StreamInfo, StreamOutlet, local_clock, cf_double64, cf_string
-from .config import load, fresh, save_json, sample_elapsed, wall_duration, sample_count, marker_events
+from helpers import save_json, sample_elapsed, wall_duration, sample_count, marker_events
 
 
 def signal(kind, indices, rate, channels, events=(), elapsed=None):
@@ -106,16 +105,3 @@ def transmit(cfg, run_id, directory):
     save_json(out / 'tx_meta.json', dict(run_id=run_id, start=start, complete=True))
     # Keep outlets alive while receivers drain, including under deliberate pauses.
     time.sleep(max(2., cfg['receiver_pause'] + 1.))
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description='Generate and transmit LSL signals')
-    parser.add_argument('--config', default=str(Path(__file__).resolve().parents[1]/'settings.py'))
-    parser.add_argument('--id', default='test', help='Same ID as the receiver')
-    parser.add_argument('--out', default='results/manual/tx')
-    args = parser.parse_args(argv)
-    transmit(load(args.config), args.id, fresh(args.out)/'data')
-
-
-if __name__ == '__main__':
-    main()

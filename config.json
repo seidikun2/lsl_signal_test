@@ -1,0 +1,45 @@
+{
+  "tests": {
+    "run": ["eeg", "streams"],
+    "length_mode": "seconds",
+    "duration_s": 5,
+    "samples_per_stream": 1024,
+    "eeg": {
+      "rates": [128, 256, 512, 1024, 2048],
+      "channels": [16, 32, 64, 128],
+      "chunks": [16],
+      "buffers_s": [60],
+      "pauses_s": [0],
+      "repeats": 1
+    },
+    "streams": {
+      "repeats": 1
+    }
+  },
+  "acquisition": {
+    "chunk": 16,
+    "inlet_buffer": 60,
+    "receiver_pause": 0,
+    "pause_every": 2,
+    "sensors": [
+      {"name": "eeg", "kind": "EEG", "rate": 512, "channels": 32},
+      {"name": "emg", "kind": "EMG", "rate": 2000, "channels": 8},
+      {"name": "imu", "kind": "IMU", "rate": 100, "channels": 9}
+    ],
+    "markers": [
+      {"label": "A", "interval": 2.0, "first": 0.3, "delay": 0.2, "width": 0.08, "amplitude": 1.0},
+      {"label": "B", "interval": 2.0, "first": 0.9, "delay": 0.2, "width": 0.08, "amplitude": -1.0},
+      {"label": "C", "interval": 2.0, "first": 1.5, "delay": 0.2, "width": 0.08, "amplitude": 0.6}
+    ],
+    "event_tolerance_ms": 10,
+    "analysis_limits": {
+      "latency_ms": 100,
+      "jitter_ms": 10,
+      "drift_ppm": 100,
+      "accumulated_ms": 1,
+      "latency_growth_ms": 20
+    },
+    "plot_channels": [0, 1],
+    "snapshot_seconds": 2
+  }
+}

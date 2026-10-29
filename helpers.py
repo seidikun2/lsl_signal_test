@@ -1,7 +1,6 @@
 """Experiment validation and shared timing helpers."""
 import json
 import math
-import runpy
 from pathlib import Path
 
 import numpy as np
@@ -42,11 +41,7 @@ def validate(config):
             raise ValueError('Acquisition rate would reach zero during the experiment')
     if len(set(names)) != len(names):
         raise ValueError('Sensor names must be unique')
-    cfg.setdefault('online_rate', max(s['rate'] for s in cfg['sensors']))
-    cfg.setdefault('online_lag', .25)
-    if cfg['online_rate'] < max(s['rate'] for s in cfg['sensors']):
-        raise ValueError('online_rate must be >= the highest sensor rate (no anti-alias downsampling is applied)')
-    for k in ('duration', 'inlet_buffer', 'correction_interval', 'pause_every', 'start_delay', 'online_rate', 'online_lag'):
+    for k in ('duration', 'inlet_buffer', 'correction_interval', 'pause_every', 'start_delay'):
         if not math.isfinite(cfg[k]) or cfg[k] <= 0:
             raise ValueError(f'{k} must be positive and finite')
     if int(cfg['inlet_buffer']) != cfg['inlet_buffer']:
@@ -59,6 +54,11 @@ def validate(config):
         raise ValueError('receiver_pause must be finite and nonnegative')
     if not math.isfinite(cfg['event_tolerance_ms']) or cfg['event_tolerance_ms'] <= 0:
         raise ValueError('event_tolerance_ms must be positive')
+    if not math.isfinite(cfg.get('snapshot_seconds',2)) or cfg.get('snapshot_seconds',2) <= 0:
+        raise ValueError('snapshot_seconds must be positive')
+    channels = cfg.get('plot_channels',[0,1])
+    if not isinstance(channels,list) or not 1<=len(channels)<=2 or any(not isinstance(c,int) or c<0 for c in channels):
+        raise ValueError('plot_channels must contain one or two nonnegative channel indices')
     cfg.setdefault('markers', [dict(label='A', interval=2., first=.3, delay=.2, width=.08, amplitude=1.),
                                dict(label='B', interval=2., first=.9, delay=.2, width=.08, amplitude=-1.),
                                dict(label='C', interval=2., first=1.5, delay=.2, width=.08, amplitude=.6)])
@@ -78,22 +78,6 @@ def validate(config):
     if len(labels) != len(set(labels)):
         raise ValueError('Marker labels must be unique')
     return cfg
-
-
-def load(path):
-    path = Path(path)
-    if path.suffix == '.py':
-        settings = runpy.run_path(str(path))
-        content = json.loads(json.dumps(settings['CONFIG']))
-        tests = settings.get('TESTS', {})
-        content['duration'] = tests.get('duration_s', content.get('duration', 10))
-        if tests.get('length_mode') == 'samples':
-            for sensor in content['sensors']:
-                sensor['samples'] = tests['samples_per_stream']
-            content['duration'] = max(s['samples']/s['rate'] for s in content['sensors'])
-    else:
-        content = json.loads(path.read_text())
-    return validate(content)
 
 
 def sample_elapsed(nominal, sensor):
@@ -136,9 +120,71 @@ def marker_events(cfg):
     return events
 
 
-def fresh(path):
-    out = Path(path)
-    if out.exists() and any(out.iterdir()):
-        raise ValueError(f'Output directory is not empty: {out}')
-    out.mkdir(parents=True, exist_ok=True)
-    return out
+def read_settings(path):
+    """Read the single user-facing JSON configuration."""
+    document = json.loads(Path(path).read_text(encoding='utf-8'))
+    return {'TESTS': document['tests'], 'CONFIG': document['acquisition']}
+
+
+def prepare_results(path):
+    """Archive obsolete folders and previous outputs outside the checkout."""
+    import shutil
+    from datetime import datetime
+    project=Path(__file__).resolve().parent
+    path=Path(path).resolve()
+    default=project/'results'
+    previous=path.exists() and any(p.is_file() for p in path.rglob('*'))
+    if previous and path!=default:
+        raise ValueError(f'Output directory is not empty: {path}')
+    names=['codigo','lsl_lab','lsltest','resultados','runs','reuns','tests','__pycache__','.pytest_cache']
+    legacy=[project/name for name in names if (project/name).is_dir()]
+    legacy+=list(project.glob('*.egg-info'))
+    if previous or legacy:
+        archive=project.parent/(project.name+'-history')/datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        archive.mkdir(parents=True)
+        for folder in legacy:
+            shutil.move(folder,archive/folder.name)
+        if previous:
+            shutil.move(path,archive/'results')
+        print(f'Previous results and obsolete folders preserved at {archive}',flush=True)
+    path.mkdir(parents=True,exist_ok=True)
+    return path
+
+
+def pack_recording(source, destination):
+    """Save numeric traces and JSON metadata together, without pickle."""
+    arrays = {}
+    metadata = {}
+    for path in Path(source).glob('*.npz'):
+        if not path.stem.startswith(('tx_', 'rx_')):
+            continue
+        with np.load(path, allow_pickle=False) as data:
+            for key in data.files:
+                arrays[path.stem+'__'+key] = data[key]
+    for path in Path(source).glob('*.json'):
+        metadata[path.stem] = json.loads(path.read_text())
+    arrays['metadata_json'] = np.array(json.dumps(metadata, allow_nan=False))
+    np.savez_compressed(destination, **arrays)
+
+
+def unpack_recording(source, destination):
+    """Restore a saved recording to a temporary analysis directory."""
+    import re
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    with np.load(source, allow_pickle=False) as data:
+        metadata = json.loads(str(data['metadata_json']))
+        groups = {}
+        for key in data.files:
+            if key == 'metadata_json':
+                continue
+            stem, field = key.rsplit('__', 1)
+            if not re.fullmatch(r'[A-Za-z0-9_-]+',stem) or not re.fullmatch(r'[A-Za-z0-9_]+',field):
+                raise ValueError('Invalid recording key')
+            groups.setdefault(stem, {})[field] = data[key]
+        for stem, values in groups.items():
+            np.savez(destination/(stem+'.npz'), **values)
+        for name, value in metadata.items():
+            if not name.replace('_','').isalnum():
+                raise ValueError('Invalid metadata key')
+            save_json(destination/(name+'.json'), value)

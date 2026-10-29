@@ -1,11 +1,13 @@
 """Reconstruct by timestamp, measure errors and generate figures and summaries."""
+import sys
+sys.dont_write_bytecode = True
 import argparse
 import csv
 import json
 from pathlib import Path
 
 import numpy as np
-from .config import sample_count
+from helpers import sample_count
 
 
 DEFAULT_LIMITS = dict(latency_ms=100., jitter_ms=10., drift_ppm=100.,
@@ -239,66 +241,133 @@ def case_result(name, cfg, sensor, metrics=None, error=''):
         drift_limit_ppm=limit['drift_ppm'], accumulated_limit_ms=limit['accumulated_ms'])
 
 
-def write_comparison(out, rows, title='Case summary', links=None, plot=True):
-    import matplotlib
-    matplotlib.use('Agg')
+def plot_snapshot(out, case, sensor, cfg, tx, rx, markers_tx, markers_rx, origin, offset):
+    """Show at most two channels in the original common time domain."""
     import matplotlib.pyplot as plt
-    out=Path(out)
-    figures=out/'figures'
-    figures.mkdir(exist_ok=True)
-    with (out/'summary.csv').open('w',newline='',encoding='utf-8') as f:
+    channels=[c for c in cfg.get('plot_channels',[0,1]) if c<sensor['channels']][:2] or [0]
+    window=cfg.get('snapshot_seconds',2.)
+    fig,axes=plt.subplots(len(channels)+1,1,figsize=(13,3*len(channels)+2),constrained_layout=True)
+    tx_time=tx['sample']-origin
+    rx_time=rx['corrected']-origin-offset
+    read_time=rx['arrival']-origin-offset
+    colors={m['label']:plt.get_cmap('tab10')(i) for i,m in enumerate(cfg['markers'])}
+    for ax,channel in zip(axes[:-1],channels):
+        source=(tx_time>=0)&(tx_time<=window)
+        acquisition=(rx_time>=0)&(rx_time<=window)
+        delivery=(read_time>=0)&(read_time<=window)
+        values=rx['values'][:,channel].astype(float).copy()
+        values[np.r_[False,np.diff(rx['ids'])!=1]]=np.nan
+        ax.plot(tx_time[source],tx['values'][source,channel],label='Transmitted',lw=1.2)
+        ax.plot(rx_time[acquisition],values[acquisition],'--',label='Received: acquisition timestamps',lw=1)
+        positions=np.flatnonzero(delivery)
+        positions=positions[::max(1,len(positions)//1500)]
+        ax.scatter(read_time[positions],rx['values'][positions,channel],s=5,alpha=.45,label='Received: read timestamps')
+        for event in markers_tx:
+            if event['kind']!='stimulus': continue
+            t=event['sample_time']-origin
+            if 0<=t<=window:
+                color=colors[event['label']]
+                ax.axvline(t,color=color,lw=.9)
+                ax.text(t,.97,event['label'],transform=ax.get_xaxis_transform(),color=color,va='top')
+                ax.axvline(t+event['delay'],color=color,ls=':',lw=.8)
+        for event in markers_rx:
+            if event['kind']!='stimulus': continue
+            t=event['arrival']-origin-offset
+            if 0<=t<=window: ax.axvline(t,color=colors[event['label']],ls='--',lw=.6,alpha=.7)
+        ax.set(xlim=(0,window),ylabel=f'Channel {channel+1}')
+        ax.grid(alpha=.15)
+    axes[0].legend(loc='upper right',fontsize=8)
+    axes[-1].plot(rx['raw']-origin,(rx['arrival']-rx['corrected'])*1000,lw=.7)
+    axes[-1].set(xlabel='Time from common origin (s)',ylabel='Read latency (ms)',title='Full recording: acquisition-to-read delay')
+    axes[-1].grid(alpha=.2)
+    fig.suptitle(f'{case} / {sensor["name"]}: {sensor["rate"]:g} Hz, {sensor["channels"]} channels\n'
+                 'Solid marker = TX; dashed = RX read; dotted = expected response. No time realignment.')
+    fig.savefig(Path(out)/f'{case}_{sensor["name"]}_snapshot.png',dpi=120)
+    plt.close(fig)
+
+
+def write_metrics(out, rows):
+    with (Path(out)/'metrics.csv').open('w',newline='',encoding='utf-8') as f:
         writer=csv.DictWriter(f,fieldnames=list(rows[0]),lineterminator='\n')
         writer.writeheader(); writer.writerows(rows)
-    def fmt(x):
-        return '—' if x is None else f'{x:.2f}'
-    lines=[f'# {title}', '',
-        'No delivery-delay compensation. Acquisition drift and delivery timing are separate observations.', '',
-        '| Case / stream | Streams | Hz / channels / chunk / buffer / pause | Samples RX/TX | Latency p99 (ms) | Acquisition drift (ppm) | Accumulated drift (ms) | Responses RX/expected | Max response delivery error (ms) | Issues |',
-        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
-    for r in rows:
-        name=r['case']+'/'+r['stream']
-        if links and r['case'] in links: name=f'[{name}]({links[r["case"]]})'
-        condition=f'{r["rate_hz"]:g} / {r["channels"]} / {r["chunk"]} / {r["buffer_s"]:g}s / {r["pause_s"]:g}s'
-        issues='FAILED: '+r['error'].replace('|','/').replace('\n',' ') if r['error'] else r['issues'].replace(';',', ') or 'none above limits'
-        samples=f'{r["received"]}/{r["expected"]}' if r['expected'] is not None else '—'
-        responses=f'{r["responses_detected"]}/{r["responses_expected"]}' if r['responses_expected'] is not None else '—'
-        lines.append(f'| {name} | {r["stream_count"]} | {condition} | {samples} | {fmt(r["latency_p99_ms"])} | '
-            f'{fmt(r["acquisition_drift_ppm"])}'+(' **(!)**' if r['drift_flag'] else '')+
-            f' | {fmt(r["accumulated_drift_ms"])} | {responses} | {fmt(r["response_error_ms"])} | {issues} |')
-    for start in range(0,len(rows) if plot else 0,16):
-        page=rows[start:start+16]
-        fig,axes=plt.subplots(2,2,sharey=True,figsize=(15,max(6,.55*len(page)+2)),constrained_layout=True)
-        labels=[f'{r["case"]}/{r["stream"]}\n{r["rate_hz"]:g} Hz, {r["channels"]} ch, {r["stream_count"]} streams' for r in page]
-        for ax,(key,label,threshold) in zip(axes.flat,[
-                ('latency_p99_ms','Latency p99 (ms)','latency_limit_ms'),
+
+
+def write_flat_comparison(out, rows):
+    """One compact overview per test; no per-case folders."""
+    import matplotlib.pyplot as plt
+    out=Path(out)
+    for start in range(0,len(rows),20):
+        page=rows[start:start+20]
+        fig,axes=plt.subplots(1,3,sharey=True,figsize=(15,max(4,.4*len(page)+2)),constrained_layout=True)
+        for ax,(key,title,limit) in zip(axes,[('latency_p99_ms','Latency p99 (ms)','latency_limit_ms'),
                 ('acquisition_drift_ppm','Acquisition drift (ppm)','drift_limit_ppm'),
-                ('accumulated_drift_ms','Accumulated acquisition drift (ms)','accumulated_limit_ms'),
-                ('delivery_error_ms','Accumulated delivery error (ms)','accumulated_limit_ms')]):
+                ('accumulated_drift_ms','Accumulated drift (ms)','accumulated_limit_ms')]):
             for i,r in enumerate(page):
-                value=r[key]
-                if value is None: ax.text(0,i,'no measurement',va='center',color='gray')
-                else:
-                    ax.barh(i,value,color='firebrick' if abs(value)>r[threshold] else 'steelblue')
-                    ax.annotate(f'{value:.2f}',(value,i),xytext=(3 if value>=0 else -3,0),textcoords='offset points',ha='left' if value>=0 else 'right',va='center',fontsize=8)
-                    if key=='acquisition_drift_ppm' and r['source_drift_ppm'] is not None:
-                        ax.scatter(r['source_drift_ppm'],i,marker='D',facecolors='none',edgecolors='black',s=25,zorder=3)
-            ax.set_yticks(np.arange(len(page)),labels,fontsize=7)
-            ax.set_xlabel(label); ax.grid(axis='x',alpha=.2); ax.axvline(0,color='gray',lw=.5)
-            low,high=ax.get_xlim(); ax.set_xlim(low-.15*(high-low),high+.2*(high-low))
-        axes[0,0].set_ylim(len(page)-.5,-.5)
-        fig.suptitle(title+' — red: configured limit exceeded; diamond: source-clock drift')
-        filename=f'comparison_{start//16+1:02}.png'
-        fig.savefig(figures/filename,dpi=120); plt.close(fig)
-        lines+=['',f'![Case comparison](figures/{filename})']
-    injected=[f'{r["case"]}/{r["stream"]}: {r["injected_drift_ppm"]:g} ppm, slope {r["injected_slope_ppm_s"]:g} ppm/s'
-              for r in rows if r['injected_drift_ppm'] or r['injected_slope_ppm_s']]
-    lines+=['','**Injected drift:** '+('; '.join(injected) if injected else 'zero in all cases.'),
-        '', 'Delivery error includes batching, queues and scheduling; it is not pure clock drift.',
-        'Acquisition drift is estimated from LSL-corrected timestamps; short recordings are sensitive to clock-estimation noise.',
-        'Response delivery error compares the observed RX marker-to-response interval with the observed TX interval.',
-        'Missing responses, missing markers and recording boundaries are listed in each case event table.',
-        'Limits are illustrative. No flag does not certify physical synchronization.']
-    (out/'summary.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+                if r[key] is None: ax.text(0,i,'not measured',va='center')
+                else: ax.barh(i,r[key],color='firebrick' if abs(r[key])>r[limit] else 'steelblue')
+            ax.set_yticks(range(len(page)),[r['case']+'/'+r['stream'] for r in page],fontsize=8)
+            ax.set_xlabel(title); ax.grid(axis='x',alpha=.2)
+        axes[0].set_ylim(len(page)-.5,-.5)
+        fig.suptitle('All measured cases — red: configured limit exceeded')
+        fig.savefig(out/f'comparison_{start//20+1:02}.png',dpi=120); plt.close(fig)
+
+
+def write_report(root, plan, rows, event_rows, marker_rows):
+    """One self-contained HTML report with every case, not a selected subset."""
+    from html import escape
+    root=Path(root)
+    def cell(value):
+        if value is None: return '—'
+        if isinstance(value,float): return f'{value:.3f}'
+        return escape(str(value))
+    def table(records, columns):
+        if not records: return '<p>Not measured yet.</p>'
+        text='<div class="scroll"><table><thead><tr>'+''.join('<th>'+escape(label)+'</th>' for _,label in columns)+'</tr></thead><tbody>'
+        for row in records:
+            issue=row.get('issues','') or row.get('status','')=='failed'
+            text+='<tr'+(' class="issue"' if issue else '')+'>'+''.join('<td>'+cell(row.get(key))+'</td>' for key,_ in columns)+'</tr>'
+        return text+'</tbody></table></div>'
+    html=['<!doctype html><html lang="en"><meta charset="utf-8"><title>LSL simulation results</title>',
+          '<style>body{font:15px system-ui;margin:24px;color:#20242a}table{border-collapse:collapse;width:100%}th,td{padding:7px;border:1px solid #ddd;text-align:left;white-space:nowrap}th{background:#e8eef4;position:sticky;top:0}.scroll{overflow:auto;margin:15px 0}.issue{background:#fff0e8}img{max-width:100%;height:auto}details{margin:15px 0}small{color:#555}</style>',
+          '<h1>LSL simulation — complete results</h1>',
+          '<p>All planned cases are listed below. Blank measurements are not zero. Reload this file while the run progresses.</p>',
+          '<p><a href="plan.csv">Plan CSV</a> · <a href="plan.png">Plan and estimated runtime</a></p>']
+    html.append(table(plan,[('case','Case'),('test','Test'),('status','Status'),('sensors','Streams'),('rates_hz','Rates (Hz)'),
+          ('channels','Channels'),('samples','Planned samples'),('chunk','Chunk'),('buffer_s','Buffer (s)'),('pause_s','Pause (s)'),
+          ('acquisition_s','Acquire (s)'),('estimate_low_s','Estimate low (s)'),('estimate_high_s','Estimate high (s)'),('actual_s','Actual (s)'),('error','Error')]))
+    for number,experiment in [(1,'eeg'),(2,'streams')]:
+        selected=[r for r in rows if r['experiment']==experiment]
+        if not any(p['test']==number for p in plan): continue
+        folder=f'test_{number}'
+        html += [f'<h2>Test {number}: '+('EEG channels × rate' if number==1 else 'Incremental streams')+'</h2>']
+        downloads=[f'<a href="{folder}/{file}">{label}</a>' for file,label in
+                   [('metrics.csv','All case metrics'),('events.csv','Every response event'),('markers.csv','Marker spacing by class')]
+                   if (root/folder/file).exists()]
+        html.append('<p>'+(' · '.join(downloads) if downloads else 'Measurements will appear after recording.')+'</p>')
+        html.append(table(selected,[('case','Case'),('stream','Stream'),('stream_count','Streams'),('rate_hz','Hz'),('channels','Channels'),
+              ('received','Received'),('expected','Transmitted'),('missing','Missing'),('latency_p99_ms','Latency p99 (ms)'),('jitter_ms','Jitter (ms)'),
+              ('source_drift_ppm','TX drift (ppm)'),('acquisition_drift_ppm','RX drift (ppm)'),('accumulated_drift_ms','Accumulated drift (ms)'),
+              ('delivery_error_ms','Delivery change (ms)'),('response_error_ms','Max response error (ms)'),('issues','Flags'),('error','Error')]))
+        for image_path in sorted((root/folder).glob('*.png')):
+            if '_snapshot' not in image_path.stem:
+                html.append(f'<img src="{folder}/{escape(image_path.name)}" alt="All case comparisons">')
+        events=[e for e in event_rows if e['test']==number]
+        markers=[e for e in marker_rows if e['test']==number]
+        html += ['<h3>Marker spacing — every case and class</h3>',table(markers,[('case','Case'),('class','Class'),('expected','TX'),('received','RX'),
+                 ('missing','Missing'),('duplicates','Duplicates'),('expected_ms','Expected (ms)'),('tx_ms','TX median (ms)'),
+                 ('rx_acquisition_ms','RX timestamp median (ms)'),('rx_delivery_ms','RX read median (ms)')]),
+                 '<details><summary>Every marker-to-response measurement</summary>',
+                 table(events,[('case','Case'),('stream','Stream'),('label','Class'),('sequence','Event'),('expected_ms','Expected (ms)'),('tx_ms','TX (ms)'),
+                      ('rx_acquisition_ms','RX timestamps (ms)'),('rx_delivery_ms','RX read (ms)'),('delivery_error_ms','Delivery error (ms)'),('status','Status')]),'</details>',
+                 '<h3>Signal snapshots — all recorded cases and streams</h3>']
+        for r in selected:
+            filename=f'{r["case"]}_{r["stream"]}_snapshot.png'
+            if (root/folder/filename).exists():
+                html.append(f'<details><summary>{escape(r["case"]+" / "+r["stream"])} — {r["rate_hz"]:g} Hz, {r["channels"]} channels</summary><img loading="lazy" src="{folder}/{filename}" alt="Transmitted and received signals with markers"></details>')
+    html += ['<p>Delivery change is a last-minus-first timing difference, including chunk phase and queues; it is not pure clock drift. Accumulated drift is a time difference, not a sum of delays.</p>',
+             '<p>Sample timestamps are simulated; read times are measured. Clock mapping does not remove delivery delay. Short-run drift estimates include LSL clock-estimation noise. Marker response detection uses the known synthetic baseline.</p>',
+             '<p>Flag thresholds are configurable, not physical synchronization guarantees. A recording NPZ file is saved per case; earlier result folders are preserved outside the project.</p></html>']
+    (root/'summary.html').write_text('\n'.join(html),encoding='utf-8')
 
 
 def write_eeg_matrix(out, rows):
@@ -333,69 +402,13 @@ def write_eeg_matrix(out, rows):
             fig.colorbar(image,ax=ax,shrink=.8)
         fig.suptitle(f'EEG matrix — chunk {group[0]}, buffer {group[1]:g}s, pause {group[2]:g}s\nMedian of measured repetitions; see plan.csv for execution status')
         filename=f'eeg_matrix_{index:02}.png'
-        fig.savefig(out/'figures'/filename,dpi=120); plt.close(fig)
-        with (out/'summary.md').open('a',encoding='utf-8') as f:
-            f.write(f'\n![EEG matrix](figures/{filename})\n')
-
-
-def plot_diagnostics(out, name, sensor, cfg, tx, rx, data, reconstructed, metrics, trends):
-    import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(6, 1, figsize=(12, 18), constrained_layout=True)
-    t = reconstructed['time']
-    # Zoom where delivery is slowest, rather than hiding later problems behind a
-    # first-three-seconds-only view. All series use the SAME absolute origin.
-    worst = int(np.argmax(data['latency']))
-    origin = tx['sample'][0]-t[0]
-    center = tx['sample'][data['it'][worst]]-origin
-    left = max(0., center-1.)
-    right = left+max(2., min(4., metrics['latency_ms']['max']/1000+1.))
-    view = (t >= left) & (t <= right)
-    for key, label, style in [('tx', 'TX: simulated acquisition', '-'),
-                              ('generated', 'TX: latest generated value', ':'),
-                              ('rx_acquisition', 'RX: corrected acquisition timestamp', '--'),
-                              ('rx_delivery', 'RX: latest value available at read time', '-')]:
-        axes[0].plot(t[view], reconstructed[key][view, 0], style, label=label,
-                     alpha=.7 if key == 'rx_delivery' else 1.)
-    axes[0].set(xlabel='Time from common origin (s)', ylabel='Channel 0',
-                title='Timestamp reconstruction without delay compensation — highest-latency region')
-    for key, label in [('tx', 'TX'), ('rx_acquisition', 'RX acquisition'), ('rx_delivery', 'RX delivery')]:
-        axes[1].plot(t[view], (reconstructed[key]-reconstructed['tx'])[view, 0], label=label)
-    axes[1].set(xlabel='Time from common origin (s)', ylabel='Amplitude error at the same time',
-                title='Timing error: intact values can be available at the wrong time')
-    elapsed = data['elapsed']
-    axes[2].plot(elapsed, data['latency']*1000, label='Acquisition to read', lw=.7)
-    axes[2].plot(elapsed, data['queue']*1000, label='Send to read', alpha=.6, lw=.7)
-    axes[2].axhline(metrics['limits']['latency_ms'], color='r', ls=':', label='Reference p99 limit')
-    axes[2].set(xlabel='Nominal time (s)', ylabel='Latency (ms)')
-    axes[3].plot(elapsed, data['timing_tx']*1000, label='TX vs nominal rate')
-    axes[3].plot(elapsed, data['timing_rx']*1000, '--', label='RX acquisition vs nominal rate')
-    axes[3].set(xlabel='Nominal time (s)', ylabel='Accumulated error (ms)',
-                title='Accumulated acquisition drift (not the sum of delays)')
-    axes[4].plot(elapsed, (data['latency']-data['latency'][0])*1000, label='Latency change since the first sample')
-    axes[4].plot(elapsed, data['read_error']*1000, alpha=.6, label='Delivery error vs nominal rate')
-    axes[4].set(xlabel='Nominal time (s)', ylabel='Accumulated change (ms)',
-                title='Delivery: queues and pauses can grow without changing values')
-    valid = [w for w in trends if w['drift_ppm'] is not None]
-    axes[5].plot([w['time'] for w in valid], [w['drift_ppm'] for w in valid], '.-', label='Local drift (2-second windows)')
-    axes[5].axhline(0, color='gray', lw=.5)
-    axes[5].set(xlabel='Nominal time (s)', ylabel='Drift local (ppm)',
-                title='Local drift — short estimates are sensitive to clock-correction noise')
-    for ax in axes:
-        ax.grid(alpha=.25)
-        ax.legend(loc='upper right', fontsize=8)
-    flags = metrics['issues']
-    status = '; '.join(f['message'] for f in flags) or 'No configured limit exceeded (not a physical synchronization certificate)'
-    from textwrap import fill
-    fig.suptitle(f'{name}: {sensor["rate"]} Hz / {sensor["channels"]} channels / chunk {cfg["chunk"]}\n'
-                 + fill(status, 105), color='darkred' if flags else 'darkgreen', fontsize=11)
-    fig.savefig(out/f'{name}.png', dpi=120)
-    plt.close(fig)
+        fig.savefig(out/filename,dpi=120); plt.close(fig)
 
 
 def analyze_responses(cfg, sensor, tx, rx, txmarkers, rxmarkers, figures):
     """Detect actual pulse samples against the known synthetic baseline."""
     import matplotlib.pyplot as plt
-    from .generator import signal
+    from transmission import signal
     stimuli=[e for e in txmarkers if e['kind']=='stimulus']
     received={e['id']:e for e in rxmarkers if e['kind']=='stimulus'}
     scale={'EEG':60.,'EMG':140.,'IMU':3.}[sensor['kind'].upper()]
@@ -440,39 +453,6 @@ def analyze_responses(cfg, sensor, tx, rx, txmarkers, rxmarkers, figures):
             record['acquisition_error_ms']=record['rx_acquisition_ms']-record['tx_ms']
             record['delivery_error_ms']=record['rx_delivery_ms']-record['tx_ms']
         records.append(record)
-    by_id={e['id']:e for e in stimuli}
-    classes=list(dict.fromkeys(e['label'] for e in stimuli))
-    if classes:
-        fig,axes=plt.subplots(len(classes),2,squeeze=False,figsize=(13,3*len(classes)),constrained_layout=True)
-        for row,label in enumerate(classes):
-            examples=[r for r in records if r['label']==label and r['status']=='detected']
-            candidates=examples or [r for r in records if r['label']==label]
-            rec=candidates[0]; event=by_id[rec['marker_id']]; marker=received.get(event['id'])
-            tx_time=tx['sample']-event['sample_time']
-            delivery=(rec['rx_delivery_ms']/1000) if rec['rx_delivery_ms'] is not None else event['delay']
-            window=(min(-.15,delivery-.15),max(event['delay']+event['width']+.3,delivery+event['width']+.15))
-            for col in range(2):
-                ax=axes[row,col]
-                mask=(tx_time>=window[0])&(tx_time<=window[1])
-                ax.plot(tx_time[mask],tx['values'][mask,0],label='Original TX')
-                if marker:
-                    rt=(rx['corrected']-marker['corrected']) if col==0 else (rx['arrival']-marker['arrival'])
-                    keep=(rt>=window[0])&(rt<=window[1])
-                    values=rx['values'][:,0].astype(float).copy()
-                    values[np.r_[False,np.diff(rx['ids'])!=1]]=np.nan
-                    if col==0: ax.plot(rt[keep],values[keep],'--',label='RX acquisition timestamps')
-                    else: ax.scatter(rt[keep],values[keep],s=8,alpha=.6,label='RX read timestamps (chunks arrive together)')
-                ax.axvline(0,color='black',lw=.8,label=f'Marker {label}')
-                ax.axvline(event['delay'],color='firebrick',ls=':',label=f'Expected response: {event["delay"]*1000:g} ms')
-                ax.set(xlim=window,xlabel='Time from this marker (s)',ylabel='Channel 0',
-                       title=f'Class {label} ({rec["status"]}): '+('acquisition reconstruction' if col==0 else 'availability at receiver'))
-                if rec['status']=='detected':
-                    interval=rec['rx_acquisition_ms'] if col==0 else rec['rx_delivery_ms']
-                    ax.set_title(f'{label}: TX {rec["tx_ms"]:.2f} ms / RX {interval:.2f} ms',
-                                 color='firebrick' if abs(interval-rec['tx_ms'])>cfg['event_tolerance_ms'] else 'black')
-                ax.legend(fontsize=7); ax.grid(alpha=.2)
-        fig.suptitle(f'{sensor["name"]}: marker-to-response timing (event-relative display, no fitted delay)')
-        fig.savefig(figures/f'{sensor["name"]}_events.png',dpi=120); plt.close(fig)
     errors=[abs(r['delivery_error_ms']) for r in records if r['delivery_error_ms'] is not None]
     acq=[abs(r['acquisition_error_ms']) for r in records if r['acquisition_error_ms'] is not None]
     return dict(expected=sum(r['status']!='outside_recording' for r in records),
@@ -490,8 +470,7 @@ def analyze_marker_classes(cfg, txmarkers, rxmarkers, figures):
     summaries={}
     classes=cfg.get('markers',[])
     if not classes: return summaries
-    fig,axes=plt.subplots(len(classes),1,squeeze=False,figsize=(10,2.7*len(classes)),constrained_layout=True)
-    for ax,marker in zip(axes[:,0],classes):
+    for marker in classes:
         label=marker['label']
         tx=[e for e in txmarkers if e.get('label')==label]
         raw_rx=[e for e in rxmarkers if e.get('label')==label]
@@ -508,27 +487,17 @@ def analyze_marker_classes(cfg, txmarkers, rxmarkers, figures):
                 positions.append(b['sequence'])
             result[name+'_interval_ms']=distribution(intervals)
             result[name+'_interval_error_ms']=distribution(errors)
-            ax.plot(positions,errors,'.-',label=name.replace('_',' '))
-        ax.axhline(0,color='black',lw=.5)
-        ax.set(title=f'Class {label}: expected spacing {marker["interval"]:g}s; received {len(rx)}/{len(tx)}',
-               xlabel='Within-class event index',ylabel='Spacing error (ms)')
-        ax.legend(fontsize=8); ax.grid(alpha=.2)
         summaries[label]=result
-    fig.suptitle('Marker spacing: errors account for missing marker indices')
-    fig.savefig(figures/'markers.png',dpi=120); plt.close(fig)
     return summaries
 
 
-def analyze(directory, tx_directory=None):
+def analyze(directory, output_dir=None, case='case'):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    out = Path(directory)
-    source = Path(tx_directory) if tx_directory else out
-    source = source/'data' if (source/'data').is_dir() else source
-    recorded = out/'data' if (out/'data').is_dir() else out
-    figures = out/'figures'
-    figures.mkdir(exist_ok=True)
+    source = recorded = Path(directory)
+    figures = Path(output_dir) if output_dir else source
+    figures.mkdir(parents=True, exist_ok=True)
     cfg = json.loads((source/'config.json').read_text())
     txmeta = json.loads((source/'tx_meta.json').read_text())
     rxmeta = json.loads((recorded/'rx_meta.json').read_text())
@@ -566,12 +535,7 @@ def analyze(directory, tx_directory=None):
             trends = windows(data['elapsed'], data['latency'], data['timing_rx'])
             metrics['windows'] = trends
             metrics['issues'], metrics['limits'] = diagnose(metrics, trends, cfg.get('analysis_limits'))
-            np.savez_compressed(recorded/f'{name}_recon.npz', **reconstructed)
-            plot_diagnostics(figures, name, s, cfg, tx, rx, data, reconstructed, metrics, trends)
-            with (recorded/f'{name}_windows.csv').open('w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=list(trends[0]))
-                writer.writeheader()
-                writer.writerows(trends)
+            plot_snapshot(figures, case, s, cfg, tx, rx, txmarkers, rxmarkers, txmeta['start'], anchor_offset)
         else:
             metrics['issues'], metrics['limits'] = diagnose(metrics, [], cfg.get('analysis_limits'))
         if data is None:
@@ -594,43 +558,21 @@ def analyze(directory, tx_directory=None):
         'Issue thresholds are illustrative configurable limits, not sensor requirements or physical certification.'
     ]
     (recorded/'report.json').write_text(json.dumps(report, indent=2, allow_nan=False))
-    case_rows = [case_result(sensor['name'], cfg, sensor, report['sensors'][sensor['name']])
-                 for sensor in cfg['sensors']]
-    links = {sensor['name']: f"figures/{sensor['name']}.png" for sensor in cfg['sensors']}
-    write_comparison(out, case_rows, 'Recording summary', links, plot=False)
-    with (out/'summary.md').open('a',encoding='utf-8') as f:
-        f.write('\n## Markers and responses\n\n')
-        if (figures/'markers.png').exists():
-            f.write('[Marker spacing](figures/markers.png)\n\n')
-        def fmt(value): return '—' if value is None else f'{value:.2f}'
-        f.write('| Class | TX/RX markers | Missing | Duplicates | Expected spacing (ms) | TX spacing (ms) | RX acquisition spacing (ms) | RX delivery spacing (ms) |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n')
-        for label,stats in report['marker_classes'].items():
-            f.write(f'| {label} | {stats["expected"]}/{stats["received"]} | {stats["missing"]} | {stats["duplicates"]} | {stats["interval_s"]*1000:g} | '
-                    f'{fmt(stats["tx_interval_ms"]["median"])} | {fmt(stats["rx_acquisition_interval_ms"]["median"])} | {fmt(stats["rx_delivery_interval_ms"]["median"])} |\n')
-        f.write('\nSpacing columns are medians. Missing marker indices are accounted for in the spacing-error plot.\n\n')
-        f.write('| Stream | Class / event | Expected (ms) | Original TX (ms) | RX acquisition (ms) | RX delivery (ms) | Status |\n| --- | --- | --- | --- | --- | --- | --- |\n')
-        def fmt(value): return '—' if value is None else f'{value:.2f}'
-        for sensor,metrics in report['sensors'].items():
-            for e in metrics.get('responses',{}).get('events',[]):
-                f.write(f'| {sensor} | {e["label"]}/{e["sequence"]} | {fmt(e["expected_ms"])} | {fmt(e["tx_ms"])} | '
-                        f'{fmt(e["rx_acquisition_ms"])} | {fmt(e["rx_delivery_ms"])} | {e["status"]} |\n')
-            if (figures/f'{sensor}_events.png').exists():
-                f.write(f'\n[{sensor}: original and reconstructed responses](figures/{sensor}_events.png)\n\n')
-        f.write('Intervals are measured from each marker to the first detected response sample. '
-                'TX sampling quantization is shown rather than hidden. Delivery intervals use actual Python read times.\n')
-        f.write('outside_recording means the planned response falls after that stream ended; onset_lost is not a valid onset measurement.\n')
     return report
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description='Analyze recorded signals and timestamps')
-    parser.add_argument('directory', help='Recording directory')
-    parser.add_argument('--tx-dir', help='Generator directory if recorded separately')
-    args = parser.parse_args(argv)
-    report = analyze(args.directory, args.tx_dir)
-    print(json.dumps(report, indent=2))
-    print(f'Figures and summary saved in {args.directory}')
+def main():
+    import tempfile
+    from helpers import unpack_recording
+    parser=argparse.ArgumentParser(description='Reanalyze one saved recording')
+    parser.add_argument('recording',type=Path)
+    args=parser.parse_args()
+    case=args.recording.stem.removesuffix('_recording')
+    with tempfile.TemporaryDirectory(prefix='lsl_analysis_') as temporary:
+        unpack_recording(args.recording,temporary)
+        analyze(temporary,args.recording.parent,case)
+    print('Snapshots refreshed beside the recording file.')
 
 
-if __name__ == '__main__':
+if __name__=='__main__':
     main()

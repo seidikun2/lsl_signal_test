@@ -1,61 +1,55 @@
-"""Run the EEG matrix and/or the incremental-stream experiment."""
+"""Run Test 1 (EEG matrix) and Test 2 (incremental streams)."""
+import sys
+sys.dont_write_bytecode = True
 import argparse
 import csv
 import itertools
 import multiprocessing as mp
-import runpy
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lsl_lab.config import validate, fresh, save_json, wall_duration, sample_count
+from helpers import (validate, save_json, wall_duration, sample_count, read_settings,
+                     prepare_results, pack_recording)
 
 
-def run(cfg, directory):
-    from lsl_lab.generator import transmit
-    from lsl_lab.receiver import receive
-    from lsl_lab.analysis import analyze
-    out = fresh(directory)
-    data = out/'data'
-    data.mkdir()
-    run_id = uuid.uuid4().hex[:12]
-    save_json(data/'config.json', cfg)
-    save_json(data/'run.json', dict(run_id=run_id, utc=datetime.now(timezone.utc).isoformat()))
-    # Log arrays and Python lists use more than raw payload size.
-    raw_mb = sum(s['rate']*s['channels']*cfg['duration']*4 for s in cfg['sensors'])/1e6
-    print(f'{out}: {run_id}; signal payload {raw_mb:.1f} MB (RAM use is several times larger)', flush=True)
-    context = mp.get_context('spawn')
-    tx = context.Process(target=transmit, args=(cfg, run_id, str(data)), name='transmitter')
-    rx = context.Process(target=receive, args=(cfg, run_id, str(data)), name='receiver')
-    tx.start()
-    rx.start()
-    limit = time.monotonic()+120+max(wall_duration(cfg), cfg['duration'])+2*cfg['receiver_pause']
-    try:
-        while tx.is_alive() or rx.is_alive():
-            if (tx.exitcode is not None and tx.exitcode != 0) or (rx.exitcode is not None and rx.exitcode != 0):
-                raise RuntimeError(f'LSL process failed (TX={tx.exitcode}, RX={rx.exitcode}); see traceback above')
-            if time.monotonic() > limit:
-                raise TimeoutError('Experiment exceeded its time limit')
-            time.sleep(.1)
-        tx.join()
-        rx.join()
-        if tx.exitcode or rx.exitcode:
-            raise RuntimeError(f'TX={tx.exitcode}, RX={rx.exitcode}')
-    finally:
-        for process in (tx, rx):
-            if process.is_alive():
-                process.terminate()
-            process.join()
-    report = analyze(out)
-    for name, result in report['sensors'].items():
-        print(f'{name}: received={result["received"]}/{result["expected"]}, '
-              f'missing={result["missing"]}, p99={result.get("latency_ms", {}).get("p99")} ms, '
-              f'Sample RMSE={result.get("rmse")}; '
-              f'Delivery-time RMSE={result.get("temporal_reconstruction", {}).get("delivery", {}).get("rmse")}', flush=True)
-        for issue in result.get('issues', []):
-            print(f'  [WARNING] {name}: {issue["message"]}', flush=True)
-    print(f'Results: {out}/summary.md and {out}/figures/', flush=True)
+def run(cfg, output, case):
+    """Use temporary IPC files; keep only one recording archive and snapshots."""
+    import tempfile
+    from transmission import transmit
+    from reception import receive
+    from analysis import analyze
+    output=Path(output)
+    output.mkdir(parents=True,exist_ok=True)
+    started=time.monotonic()
+    with tempfile.TemporaryDirectory(prefix='lsl_recording_') as temporary:
+        raw=Path(temporary)
+        identity=uuid.uuid4().hex[:12]
+        save_json(raw/'config.json',cfg)
+        save_json(raw/'run.json',dict(case=case,run_id=identity,utc=datetime.now(timezone.utc).isoformat()))
+        context=mp.get_context('spawn')
+        tx=context.Process(target=transmit,args=(cfg,identity,temporary),name='transmission')
+        rx=context.Process(target=receive,args=(cfg,identity,temporary),name='reception')
+        tx.start(); rx.start()
+        deadline=time.monotonic()+120+max(wall_duration(cfg),cfg['duration'])+2*cfg['receiver_pause']
+        try:
+            while tx.is_alive() or rx.is_alive():
+                if any(p.exitcode is not None and p.exitcode!=0 for p in (tx,rx)):
+                    raise RuntimeError(f'LSL process failed: TX={tx.exitcode}, RX={rx.exitcode}')
+                if time.monotonic()>deadline: raise TimeoutError('Recording time limit exceeded')
+                time.sleep(.05)
+            if tx.exitcode or rx.exitcode: raise RuntimeError('An LSL process failed')
+        finally:
+            for process in (tx,rx):
+                if process.is_alive(): process.terminate()
+                process.join()
+            # Preserve available raw data even if a process failed.
+            pack_recording(raw,output/f'{case}_recording.npz')
+        report=analyze(raw,output,case)
+        report['elapsed_s']=time.monotonic()-started
+        save_json(raw/'report.json',report)
+        pack_recording(raw,output/f'{case}_recording.npz')
     return report
 
 
@@ -82,7 +76,6 @@ def build_cases(settings):
         else:
             for sensor in cfg['sensors']:
                 sensor.pop('samples', None)
-        cfg['online_rate'] = max(s['rate'] for s in cfg['sensors'])
         cfg['experiment'], cfg['length_mode'] = experiment, mode
         cases.append((experiment, name, validate(cfg)))
     for experiment in experiments:
@@ -106,70 +99,123 @@ def build_cases(settings):
     return cases
 
 
-def write_plan(root, plan):
-    with (root/'plan.csv').open('w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=list(plan[0]), lineterminator='\n')
-        writer.writeheader()
-        writer.writerows(plan)
-    lines = ['# Experiment summary', '', 'The full case list and execution status are in [plan.csv](plan.csv).', '',
-             '| Experiment | Planned | Completed | Failed | Not run | Results |', '| --- | --- | --- | --- | --- | --- |']
-    for experiment in dict.fromkeys(p['experiment'] for p in plan):
-        rows = [p for p in plan if p['experiment']==experiment]
-        completed = sum(p['status']=='completed' for p in rows)
-        failed = sum(p['status']=='failed' for p in rows)
-        link = f'[{experiment}]({experiment}/summary.md)' if completed or failed else 'not run yet'
-        lines.append(f'| {experiment} | {len(rows)} | {completed} | {failed} | {len(rows)-completed-failed} | {link} |')
-    lines += ['', 'Recordings use the configured duration or exact sample count per stream.',
-              'Startup, clock estimation, saving and plotting add time beyond acquisition.',
-              'No delivery-delay compensation or online alignment is applied.']
-    (root/'summary.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
+def make_plan(cases):
+    plan=[]
+    counters={1:0,2:0}
+    for experiment,name,cfg in cases:
+        number=1 if experiment=='eeg' else 2
+        counters[number]+=1
+        count=len(cfg['sensors'])
+        low=wall_duration(cfg)+cfg['start_delay']+max(2.,cfg['receiver_pause']+1)+.5*count
+        high=low+4+count
+        plan.append(dict(case=f'T{number}_{counters[number]:02}',test=number,status='planned',
+            length_mode=cfg['length_mode'],sensors=';'.join(s['name'] for s in cfg['sensors']),
+            rates_hz=';'.join(str(s['rate']) for s in cfg['sensors']),channels=';'.join(str(s['channels']) for s in cfg['sensors']),
+            samples=';'.join(str(sample_count(cfg,s)) for s in cfg['sensors']),chunk=cfg['chunk'],buffer_s=cfg['inlet_buffer'],
+            pause_s=cfg['receiver_pause'],acquisition_s=float(wall_duration(cfg)),estimate_low_s=low,estimate_high_s=high,
+            actual_s=None,error=''))
+    return plan
+
+
+def write_csv(path,rows):
+    if not rows: return
+    with Path(path).open('w',newline='',encoding='utf-8') as f:
+        writer=csv.DictWriter(f,fieldnames=list(rows[0]),lineterminator='\n')
+        writer.writeheader(); writer.writerows(rows)
+
+
+def write_plan(root,plan,image=False,console=False):
+    write_csv(root/'plan.csv',plan)
+    low=sum(p['estimate_low_s'] for p in plan); high=sum(p['estimate_high_s'] for p in plan)
+    if console:
+        print('\nPLANNED TESTS — no recordings have started',flush=True)
+        print('Case     Test  Streams / rates Hz / channels                 Acquire   Estimated total',flush=True)
+        for p in plan:
+            parameters=p['sensors']+' / '+p['rates_hz']+' / '+p['channels']
+            print(f'{p["case"]:<8} {p["test"]:<5} {parameters:<50} {p["acquisition_s"]:5.1f}s   {p["estimate_low_s"]:.0f}–{p["estimate_high_s"]:.0f}s',flush=True)
+        print(f'\n{len(plan)} cases; estimated total {low/60:.1f}–{high/60:.1f} minutes. Includes startup, clock estimation and analysis.',flush=True)
+        print(f'Plan saved to {root}/plan.csv and plan.png. Estimates depend on this computer.\n',flush=True)
+    if not image: return
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    for start in range(0,len(plan),25):
+        page=plan[start:start+25]
+        cells=[]
+        for p in page:
+            description='\n'.join(f'{name}: {rate} Hz / {channels} ch' for name,rate,channels in zip(p['sensors'].split(';'),p['rates_hz'].split(';'),p['channels'].split(';')))
+            description+=f'\nchunk {p["chunk"]}; buffer {p["buffer_s"]:g}s; pause {p["pause_s"]:g}s'
+            cells.append([p['case'],p['test'],description,f'{p["acquisition_s"]:.1f}s',
+                          f'{p["estimate_low_s"]:.0f}–{p["estimate_high_s"]:.0f}s',p['status'],
+                          '—' if p['actual_s'] is None else f'{p["actual_s"]:.1f}s'])
+        fig,ax=plt.subplots(figsize=(15,max(4,sum(.45+.12*len(p['sensors'].split(';')) for p in page)+1.5)))
+        ax.axis('off')
+        table=ax.table(cellText=cells,colLabels=['Case','Test','Conditions','Acquire','Estimate','Status','Actual'],
+                       colWidths=[.08,.05,.43,.08,.12,.12,.08],cellLoc='left',loc='center')
+        table.auto_set_font_size(False); table.set_fontsize(8)
+        for (r,c),cell in table.get_celld().items():
+            cell.set_height(.04 if r==0 else (.45+.12*len(page[r-1]['sensors'].split(';')))/(fig.get_figheight()-1))
+            if r==0: cell.set_facecolor('#dce8f4')
+            elif page[r-1]['status']=='failed': cell.set_facecolor('#ffe0da')
+        ax.set_title(f'Complete test plan — estimated total {low/60:.1f}–{high/60:.1f} min\nHeuristic estimate; actual timing is recorded for every case',pad=15)
+        fig.savefig(root/('plan.png' if start==0 else f'plan_{start//25+1:02}.png'),dpi=130,bbox_inches='tight')
+        plt.close(fig)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Run the LSL experiments configured in settings.py')
-    parser.add_argument('--config', default=str(Path(__file__).with_name('settings.py')))
-    parser.add_argument('--out', help='New output directory (default: results/timestamp)')
-    args = parser.parse_args()
-    settings = runpy.run_path(args.config)
-    cases = build_cases(settings)
-    root = fresh(args.out or f'results/{datetime.now():%y%m%d_%H%M%S_%f}')
-    plan = [dict(experiment=e, case=name, status='planned', length_mode=cfg['length_mode'],
-                 duration_s=cfg['duration'], streams=len(cfg['sensors']),
-                 sensors=';'.join(s['name'] for s in cfg['sensors']),
-                 rates_hz=';'.join(str(s['rate']) for s in cfg['sensors']),
-                 channels=';'.join(str(s['channels']) for s in cfg['sensors']),
-                 samples=';'.join(str(sample_count(cfg,s)) for s in cfg['sensors']),
-                 chunk=cfg['chunk'], buffer_s=cfg['inlet_buffer'], pause_s=cfg['receiver_pause'],
-                 marker_classes=';'.join(m['label'] for m in cfg['markers'])) for e,name,cfg in cases]
-    write_plan(root, plan)
-    print(f'{len(cases)} cases; {sum(wall_duration(c) for _,_,c in cases)/60:.1f} minutes acquisition, plus startup and analysis.', flush=True)
-    from lsl_lab.analysis import case_result, write_comparison, write_eeg_matrix
-    results = {e: [] for e,_,_ in cases}
-    links = {e: {} for e in results}
-    for index, (experiment, name, cfg) in enumerate(cases):
-        directory = root/experiment
+    parser=argparse.ArgumentParser(description='Run the simulation configured in config.json')
+    parser.add_argument('--config',default=str(Path(__file__).with_name('config.json')))
+    parser.add_argument('--out',help='Optional fresh output directory')
+    parser.add_argument('--plan-only',action='store_true',help='Show and save the plan without transmitting')
+    args=parser.parse_args()
+    cases=build_cases(read_settings(args.config))
+    root=prepare_results(args.out or Path(__file__).with_name('results'))
+    plan=make_plan(cases)
+    from analysis import case_result,write_metrics,write_eeg_matrix,write_flat_comparison,write_report
+    rows=[]; event_rows=[]; marker_rows=[]
+    write_plan(root,plan,image=True,console=True)
+    write_report(root,plan,rows,event_rows,marker_rows)
+    if args.plan_only: return
+    for index,(_,_,cfg) in enumerate(cases):
+        item=plan[index]; case=item['case']; directory=root/f'test_{item["test"]}'
         directory.mkdir(exist_ok=True)
+        item['status']='running'
+        write_plan(root,plan); write_report(root,plan,rows,event_rows,marker_rows)
+        print(f'Running {case} ({index+1}/{len(cases)})...',flush=True)
+        began=time.monotonic()
         try:
-            report = run(cfg, directory/name)
+            report=run(cfg,directory,case)
             for sensor in cfg['sensors']:
-                results[experiment].append(case_result(name,cfg,sensor,report['sensors'][sensor['name']]))
-            links[experiment][name] = f'{name}/summary.md'
-            plan[index]['status'] = 'completed'
+                metric=report['sensors'][sensor['name']]
+                rows.append(case_result(case,cfg,sensor,metric))
+                for event in metric.get('responses',{}).get('events',[]):
+                    event_rows.append(dict(case=case,test=item['test'],stream=sensor['name'],**event))
+            for label,m in report['marker_classes'].items():
+                marker_rows.append(dict(case=case,test=item['test'],**{'class':label},expected=m['expected'],received=m['received'],
+                    missing=m['missing'],duplicates=m['duplicates'],expected_ms=m['interval_s']*1000,
+                    tx_ms=m['tx_interval_ms']['median'],rx_acquisition_ms=m['rx_acquisition_interval_ms']['median'],
+                    rx_delivery_ms=m['rx_delivery_interval_ms']['median']))
+            item['status']='completed'
         except Exception as error:
-            plan[index]['status'] = 'failed'
-            for sensor in cfg['sensors']:
-                results[experiment].append(case_result(name,cfg,sensor,error=str(error)))
-            print(f'[FAILED] {experiment}/{name}: {error}', flush=True)
-        write_comparison(directory, results[experiment], f'{experiment.upper()} experiment', links[experiment], plot=False)
-        write_plan(root, plan)
-    for experiment, rows in results.items():
-        write_comparison(root/experiment, rows, f'{experiment.upper()} experiment', links[experiment], plot=experiment!='eeg')
-        if experiment == 'eeg':
-            write_eeg_matrix(root/experiment, rows)
-    print(f'Open {root}/summary.md', flush=True)
-    if any(p['status']=='failed' for p in plan):
-        raise RuntimeError('Some cases failed; inspect plan.csv and the experiment summaries')
+            item['status']='failed'; item['error']=str(error)
+            for sensor in cfg['sensors']: rows.append(case_result(case,cfg,sensor,error=str(error)))
+            print(f'[FAILED] {case}: {error}',flush=True)
+        item['actual_s']=time.monotonic()-began
+        selected=[r for r in rows if r['experiment']==cfg['experiment']]
+        write_metrics(directory,selected)
+        write_csv(directory/'events.csv',[r for r in event_rows if r['test']==item['test']])
+        write_csv(directory/'markers.csv',[r for r in marker_rows if r['test']==item['test']])
+        write_plan(root,plan); write_report(root,plan,rows,event_rows,marker_rows)
+        print(f'{case}: {item["status"]} in {item["actual_s"]:.1f}s',flush=True)
+    for experiment,number in [('eeg',1),('streams',2)]:
+        selected=[r for r in rows if r['experiment']==experiment]
+        if selected:
+            if experiment=='eeg': write_eeg_matrix(root/f'test_{number}',selected)
+            else: write_flat_comparison(root/f'test_{number}',selected)
+    write_plan(root,plan,image=True); write_report(root,plan,rows,event_rows,marker_rows)
+    print(f'Open {root}/summary.html in a browser',flush=True)
+    if any(p['status']=='failed' for p in plan): raise RuntimeError('Some cases failed; see the complete summary')
 
 
-if __name__ == '__main__':
+if __name__=='__main__':
     main()
