@@ -89,5 +89,3 @@ def fresh(path):
         raise ValueError(f'Output directory is not empty: {out}')
     out.mkdir(parents=True, exist_ok=True)
     return out
-
-
