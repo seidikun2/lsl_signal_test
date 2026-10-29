@@ -1,0 +1,52 @@
+import json
+import math
+from pathlib import Path
+
+
+def validate(config):
+    cfg = json.loads(json.dumps(config))
+    defaults = dict(duration=10., chunk=16, inlet_buffer=60, correction_interval=2.,
+                    receiver_pause=0., pause_every=2., drift_ppm=0., start_delay=2.)
+    for key, value in defaults.items():
+        cfg.setdefault(key, value)
+    if not cfg.get('sensors'):
+        raise ValueError('At least one sensor is required')
+    names = []
+    for s in cfg['sensors']:
+        if s['kind'].upper() not in ('EEG', 'EMG', 'IMU'):
+            raise ValueError('kind must be EEG, EMG or IMU')
+        name = s['name']
+        if not name or name == 'markers' or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in name):
+            raise ValueError('Sensor names must be short alphanumeric identifiers')
+        names.append(name)
+        for k in ('rate', 'channels'):
+            if not math.isfinite(s[k]) or s[k] <= 0:
+                raise ValueError(f'{k} must be positive and finite')
+        if int(s['channels']) != s['channels']:
+            raise ValueError('channels must be an integer')
+        s['channels'] = int(s['channels'])
+        s.setdefault('drift_ppm', cfg['drift_ppm'])
+        if not math.isfinite(s['drift_ppm']) or abs(s['drift_ppm']) >= 100000:
+            raise ValueError('Sensor abs(drift_ppm) must be < 100000')
+    if len(set(names)) != len(names):
+        raise ValueError('Sensor names must be unique')
+    cfg.setdefault('online_rate', max(s['rate'] for s in cfg['sensors']))
+    cfg.setdefault('online_lag', .25)
+    if cfg['online_rate'] < max(s['rate'] for s in cfg['sensors']):
+        raise ValueError('online_rate must be >= the highest sensor rate (no anti-alias downsampling is applied)')
+    for k in ('duration', 'inlet_buffer', 'correction_interval', 'pause_every', 'start_delay', 'online_rate', 'online_lag'):
+        if not math.isfinite(cfg[k]) or cfg[k] <= 0:
+            raise ValueError(f'{k} must be positive and finite')
+    if int(cfg['inlet_buffer']) != cfg['inlet_buffer']:
+        raise ValueError('inlet_buffer must be an integer number of seconds')
+    if int(cfg['chunk']) != cfg['chunk'] or cfg['chunk'] < 1:
+        raise ValueError('chunk must be a positive integer')
+    if not math.isfinite(cfg['drift_ppm']) or abs(cfg['drift_ppm']) >= 100000:
+        raise ValueError('abs(drift_ppm) must be < 100000')
+    if not math.isfinite(cfg['receiver_pause']) or cfg['receiver_pause'] < 0:
+        raise ValueError('receiver_pause must be finite and nonnegative')
+    return cfg
+
+
+def load(path):
+    return validate(json.loads(Path(path).read_text()))

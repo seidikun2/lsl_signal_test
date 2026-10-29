@@ -1,0 +1,56 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "LSL: EEG",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "lsltest",
+      "args": ["run", "--config", "configs/single.json"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": true
+    },
+    {
+      "name": "LSL: Multissensor",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "lsltest",
+      "args": ["run", "--config", "configs/multi.json"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": true
+    },
+    {
+      "name": "LSL: Extremo",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "lsltest",
+      "args": ["run", "--config", "configs/extreme.json"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": true
+    },
+    {
+      "name": "LSL: Analisar resultados",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "lsltest",
+      "args": ["analyze", "${input:resultsDirectory}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ],
+  "inputs": [
+    {
+      "id": "resultsDirectory",
+      "type": "promptString",
+      "description": "Pasta do teste que será analisado (ex.: runs/run_261029_131404)",
+      "default": "runs/"
+    }
+  ]
+}
