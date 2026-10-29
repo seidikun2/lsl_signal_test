@@ -1,4 +1,4 @@
-"""Gera sinais e marcadores, simula a aquisição e transmite por LSL."""
+"""Generate signals and markers, simulate acquisition and transmit over LSL."""
 import argparse
 import json
 import time
@@ -6,36 +6,33 @@ from pathlib import Path
 
 import numpy as np
 from pylsl import StreamInfo, StreamOutlet, local_clock, cf_double64, cf_string
-from .config import load, fresh, save_json, sample_elapsed, wall_duration
+from .config import load, fresh, save_json, sample_elapsed, wall_duration, sample_count, marker_events
 
 
-def pilot(t):
-    """Common coded 40-ms pulse every second, beginning at t=0.5 s."""
-    event = np.floor(t - 0.5).astype(np.int64)
-    phase = t - 0.5 - event
-    polarity = np.where(((event * 1103515245 + 12345) >> 4) & 1, 1., -1.)
-    return np.where((t >= .5) & (phase < .04), polarity, 0.)
-
-
-def signal(kind, indices, rate, channels):
+def signal(kind, indices, rate, channels, events=(), elapsed=None):
     t = np.asarray(indices, dtype=float)[:, None] / rate
     c = np.arange(channels)[None, :]
     # Frequencies remain below Nyquist, even in the 100-Hz sweep.
     if kind.upper() == 'EEG':
         y = 20*np.sin(2*np.pi*(8 + c % 5)*t + .17*c)
         y += 8*np.sin(2*np.pi*min(22., .35*rate)*t + .11*c)
-        amplitude = 35.
+        amplitude = 60.
     elif kind.upper() == 'EMG':
         carrier = min(85., .37*rate)
         y = 70*np.sin(2*np.pi*(carrier-c % 5)*t + .23*c)
         y *= .2 + .8*np.sin(2*np.pi*.7*t)**2
-        amplitude = 100.
+        amplitude = 140.
     elif kind.upper() == 'IMU':
         y = np.sin(2*np.pi*(.7 + .1*(c % 3))*t + .4*c)
-        amplitude = 2.
+        amplitude = 3.
     else:
         raise ValueError(f'Unknown sensor: {kind}')
-    return (y + amplitude*pilot(t)).astype(np.float32)
+    clock = np.asarray(elapsed)[:, None] if elapsed is not None else t
+    for event in events:
+        onset = event['nominal']+event['delay']
+        pulse = (clock >= onset) & (clock < onset+event['width'])
+        y += amplitude*event['amplitude']*pulse
+    return y.astype(np.float32)
 
 
 def transmit(cfg, run_id, directory):
@@ -60,9 +57,9 @@ def transmit(cfg, run_id, directory):
             raise TimeoutError('Not all receivers connected within 45 s')
         time.sleep(.02)
     start = local_clock() + cfg['start_delay']
-    scale = 1 + cfg['drift_ppm'] * 1e-6
-    events = [('start', 0., -1)] + [('sync', float(t), i) for i, t in
-              enumerate(np.arange(.5, cfg['duration'], 1.))] + [('end', max(cfg['duration'], wall_duration(cfg)*scale), -2)]
+    events = [dict(kind='start', nominal=0., id=-1)]+marker_events(cfg)
+    events += [dict(kind='end', nominal=max(cfg['duration'], wall_duration(cfg)), id=-2)]
+    stimuli = [e for e in events if e['kind'] == 'stimulus']
     event_index = 0
     marker_log = []
     save_json(out / 'tx_meta.json', dict(run_id=run_id, start=start, complete=False))
@@ -70,12 +67,12 @@ def transmit(cfg, run_id, directory):
         due = []
         for s in cfg['sensors']:
             st = states[s['name']]
-            count = int(np.ceil(cfg['duration'] * s['rate']))
+            count = sample_count(cfg, s)
             if st['next'] < count:
                 end = min(st['next']+cfg['chunk'], count)
                 due.append((float(start+sample_elapsed((end-1)/s['rate'], s)), s, end))
         if event_index < len(events):
-            due.append((start + events[event_index][1]/scale, None, None))
+            due.append((start + events[event_index]['nominal'], None, None))
         if not due:
             break
         when, s, end = min(due, key=lambda x: x[0])
@@ -83,9 +80,8 @@ def transmit(cfg, run_id, directory):
         if remaining > 0:
             time.sleep(remaining)
         if s is None:
-            kind, nominal, event_id = events[event_index]
             sent = local_clock()
-            payload = dict(kind=kind, id=event_id, nominal=nominal, sample_time=when, sent=sent)
+            payload = dict(events[event_index], sample_time=when, sent=sent)
             markers.push_sample([json.dumps(payload)], timestamp=when, pushthrough=True)
             marker_log.append(payload)
             event_index += 1
@@ -93,8 +89,9 @@ def transmit(cfg, run_id, directory):
         st = states[s['name']]
         ids = np.arange(st['next'], end, dtype=np.int64)
         generated = local_clock()
-        values = signal(s['kind'], ids, s['rate'], s['channels'])
-        ts = start + sample_elapsed(ids/s['rate'], s)
+        elapsed = sample_elapsed(ids/s['rate'], s)
+        values = signal(s['kind'], ids, s['rate'], s['channels'], stimuli, elapsed)
+        ts = start + elapsed
         packet = np.column_stack((values, ids))
         sent = local_clock()
         outlets[s['name']].push_chunk(packet.tolist(), ts.tolist(), pushthrough=True)
@@ -112,12 +109,12 @@ def transmit(cfg, run_id, directory):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Gerar e transmitir sinais LSL')
-    parser.add_argument('--config', default=str(Path(__file__).resolve().parents[1]/'configuracao.py'))
-    parser.add_argument('--id', default='teste', help='Mesmo ID no receptor')
-    parser.add_argument('--out', default='resultados/manual/tx')
+    parser = argparse.ArgumentParser(description='Generate and transmit LSL signals')
+    parser.add_argument('--config', default=str(Path(__file__).resolve().parents[1]/'settings.py'))
+    parser.add_argument('--id', default='test', help='Same ID as the receiver')
+    parser.add_argument('--out', default='results/manual/tx')
     args = parser.parse_args(argv)
-    transmit(load(args.config), args.id, fresh(args.out)/'dados')
+    transmit(load(args.config), args.id, fresh(args.out)/'data')
 
 
 if __name__ == '__main__':

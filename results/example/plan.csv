@@ -1,0 +1,10 @@
+experiment,case,status,length_mode,duration_s,streams,sensors,rates_hz,channels,samples,chunk,buffer_s,pause_s,marker_classes
+eeg,f128_c16_k16_b60_p0_r1,completed,seconds,3,1,eeg,128,16,384,16,60,0,A;B;C
+eeg,f128_c128_k16_b60_p0_r1,completed,seconds,3,1,eeg,128,128,384,16,60,0,A;B;C
+eeg,f2048_c16_k16_b60_p0_r1,completed,seconds,3,1,eeg,2048,16,6144,16,60,0,A;B;C
+eeg,f2048_c128_k16_b60_p0_r1,completed,seconds,3,1,eeg,2048,128,6144,16,60,0,A;B;C
+streams,n1_r1,completed,seconds,3,1,eeg,512,32,1536,16,60,0,A;B;C
+streams,n2_r1,completed,seconds,3,2,eeg;emg,512;2000,32;8,1536;6000,16,60,0,A;B;C
+streams,n3_r1,completed,seconds,3,3,eeg;emg;imu,512;2000;100,32;8;9,1536;6000;300,16,60,0,A;B;C
+streams,exact_samples_check,completed,samples,2.57,3,eeg;emg;imu,512;2000;100,32;8;9,257;257;257,16,60,0,A;B;C
+streams,marker_spacing_check,completed,seconds,5,3,eeg;emg;imu,512;2000;100,32;8;9,2560;10000;500,16,60,0,A;B;C

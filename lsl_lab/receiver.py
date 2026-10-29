@@ -1,4 +1,4 @@
-"""Recebe streams LSL, registra tempos e valores e salva a aquisição."""
+"""Receive LSL streams and record values and timestamps."""
 import argparse
 import json
 import time
@@ -78,7 +78,7 @@ def receive(cfg, run_id, directory):
     begin = local_clock()
     aligner = OnlineAligner(cfg['sensors'], cfg['online_rate'], cfg['online_lag']) if cfg.get('online_align', False) else None
     online_times, online_values = [], {s['name']: [] for s in cfg['sensors']}
-    marker_duration = cfg['duration']/(1+cfg['drift_ppm']*1e-6)
+    marker_duration = cfg['duration']
     deadline = begin + cfg['start_delay'] + max(wall_duration(cfg), marker_duration) + 30
     refresh = begin + cfg['correction_interval']
     pause_at = begin + cfg['start_delay'] + cfg['pause_every']
@@ -154,12 +154,12 @@ def receive(cfg, run_id, directory):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Receber e gravar sinais LSL')
-    parser.add_argument('--config', default=str(Path(__file__).resolve().parents[1]/'configuracao.py'))
-    parser.add_argument('--id', default='teste', help='Mesmo ID no gerador')
-    parser.add_argument('--out', default='resultados/manual/rx')
+    parser = argparse.ArgumentParser(description='Receive and record LSL signals')
+    parser.add_argument('--config', default=str(Path(__file__).resolve().parents[1]/'settings.py'))
+    parser.add_argument('--id', default='test', help='Same ID as the generator')
+    parser.add_argument('--out', default='results/manual/rx')
     args = parser.parse_args(argv)
-    receive(load(args.config), args.id, fresh(args.out)/'dados')
+    receive(load(args.config), args.id, fresh(args.out)/'data')
 
 
 if __name__ == '__main__':

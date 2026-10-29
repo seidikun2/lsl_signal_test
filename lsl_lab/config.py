@@ -1,4 +1,4 @@
-"""Configuração dos experimentos e utilitários compartilhados."""
+"""Experiment validation and shared timing helpers."""
 import json
 import math
 import runpy
@@ -10,7 +10,7 @@ import numpy as np
 def validate(config):
     cfg = json.loads(json.dumps(config))
     defaults = dict(duration=10., chunk=16, inlet_buffer=60, correction_interval=2.,
-                    receiver_pause=0., pause_every=2., drift_ppm=0., start_delay=2.)
+                    receiver_pause=0., pause_every=2., drift_ppm=0., start_delay=2., event_tolerance_ms=10.)
     for key, value in defaults.items():
         cfg.setdefault(key, value)
     if not cfg.get('sensors'):
@@ -29,6 +29,8 @@ def validate(config):
         if int(s['channels']) != s['channels']:
             raise ValueError('channels must be an integer')
         s['channels'] = int(s['channels'])
+        if 'samples' in s and (not isinstance(s['samples'], int) or s['samples'] < 1):
+            raise ValueError('samples must be a positive integer')
         s.setdefault('drift_ppm', cfg['drift_ppm'])
         if not math.isfinite(s['drift_ppm']) or abs(s['drift_ppm']) >= 100000:
             raise ValueError('Sensor abs(drift_ppm) must be < 100000')
@@ -36,7 +38,7 @@ def validate(config):
         if not math.isfinite(ramp):
             raise ValueError('drift_slope_ppm_s must be finite')
         # The phase inversion must stay on its positive-rate branch.
-        if (1+s['drift_ppm']*1e-6)**2+2*ramp*1e-6*(cfg['duration']+1/s['rate']) <= 0:
+        if (1+s['drift_ppm']*1e-6)**2+2*ramp*1e-6*(sample_count(cfg, s)/s['rate']+1/s['rate']) <= 0:
             raise ValueError('Acquisition rate would reach zero during the experiment')
     if len(set(names)) != len(names):
         raise ValueError('Sensor names must be unique')
@@ -55,12 +57,42 @@ def validate(config):
         raise ValueError('abs(drift_ppm) must be < 100000')
     if not math.isfinite(cfg['receiver_pause']) or cfg['receiver_pause'] < 0:
         raise ValueError('receiver_pause must be finite and nonnegative')
+    if not math.isfinite(cfg['event_tolerance_ms']) or cfg['event_tolerance_ms'] <= 0:
+        raise ValueError('event_tolerance_ms must be positive')
+    cfg.setdefault('markers', [dict(label='A', interval=2., first=.3, delay=.2, width=.08, amplitude=1.),
+                               dict(label='B', interval=2., first=.9, delay=.2, width=.08, amplitude=-1.),
+                               dict(label='C', interval=2., first=1.5, delay=.2, width=.08, amplitude=.6)])
+    labels = []
+    for marker in cfg['markers']:
+        labels.append(marker['label'])
+        if not marker['label'] or not marker['label'].isascii() or not marker['label'].isalnum():
+            raise ValueError('Marker labels must be ASCII alphanumeric strings')
+        for key in ('interval', 'width'):
+            if not math.isfinite(marker[key]) or marker[key] <= 0:
+                raise ValueError(f'Marker {key} must be positive')
+        for key in ('first', 'delay'):
+            if not math.isfinite(marker[key]) or marker[key] < 0:
+                raise ValueError(f'Marker {key} must be nonnegative')
+        if not math.isfinite(marker['amplitude']) or marker['amplitude'] == 0:
+            raise ValueError('Marker amplitude must be finite and nonzero')
+    if len(labels) != len(set(labels)):
+        raise ValueError('Marker labels must be unique')
     return cfg
 
 
 def load(path):
     path = Path(path)
-    content = runpy.run_path(str(path))['CONFIG'] if path.suffix == '.py' else json.loads(path.read_text())
+    if path.suffix == '.py':
+        settings = runpy.run_path(str(path))
+        content = json.loads(json.dumps(settings['CONFIG']))
+        tests = settings.get('TESTS', {})
+        content['duration'] = tests.get('duration_s', content.get('duration', 10))
+        if tests.get('length_mode') == 'samples':
+            for sensor in content['sensors']:
+                sensor['samples'] = tests['samples_per_stream']
+            content['duration'] = max(s['samples']/s['rate'] for s in content['sensors'])
+    else:
+        content = json.loads(path.read_text())
     return validate(content)
 
 
@@ -83,7 +115,25 @@ def save_json(path, data):
 
 
 def wall_duration(cfg):
-    return float(max(sample_elapsed(cfg['duration'], s) for s in cfg['sensors']))
+    return float(max(sample_elapsed(sample_count(cfg, s)/s['rate'], s) for s in cfg['sensors']))
+
+
+def sample_count(cfg, sensor):
+    return sensor.get('samples', int(np.ceil(cfg['duration']*sensor['rate'])))
+
+
+def marker_events(cfg):
+    """Periodic classes share the transmitter clock; every event has a unique ID."""
+    events = []
+    for marker in cfg['markers']:
+        for sequence, nominal in enumerate(np.arange(marker['first'], cfg['duration'], marker['interval'])):
+            events.append(dict(kind='stimulus', nominal=float(nominal), label=marker['label'],
+                               sequence=sequence, delay=marker['delay'], width=marker['width'],
+                               amplitude=marker['amplitude'], interval=marker['interval']))
+    events.sort(key=lambda e: (e['nominal'], e['label']))
+    for identity, event in enumerate(events):
+        event['id'] = identity
+    return events
 
 
 def fresh(path):

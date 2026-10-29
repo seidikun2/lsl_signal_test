@@ -1,10 +1,10 @@
 import numpy as np
 import pytest
 
-from codigo.analise import compare
-from codigo.config import validate
-from codigo.receptor import OnlineAligner
-from codigo.gerador import signal, pilot
+from lsl_lab.analysis import compare
+from lsl_lab.config import validate
+from lsl_lab.receiver import OnlineAligner
+from lsl_lab.generator import signal
 
 
 def test_loss_duplicates_order_drift_and_clock_offset():
@@ -26,14 +26,12 @@ def test_loss_duplicates_order_drift_and_clock_offset():
     assert r['rx_timing_drift_ppm'] == pytest.approx(-199.960008, abs=.001)
 
 
-def test_signal_is_chunk_independent_and_pilot_common():
+def test_signal_is_chunk_independent():
     for kind in ('EEG', 'EMG', 'IMU'):
         a = signal(kind, np.arange(200), 100, 3)
         b = np.concatenate([signal(kind, np.arange(i, min(i+17, 200)), 100, 3)
                             for i in range(0, 200, 17)])
         np.testing.assert_array_equal(a, b)
-    assert pilot(np.array([.49, .5, .52, .55]))[0] == 0
-    assert abs(pilot(np.array([.5]))[0]) == 1
 
 
 def test_amplitude_corruption_is_detected():
