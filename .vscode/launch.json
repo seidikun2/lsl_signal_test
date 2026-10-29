@@ -35,6 +35,17 @@
       "subProcess": true
     },
     {
+      "name": "LSL: Drift crescente",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "lsltest",
+      "args": ["run", "--config", "configs/drift.json"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": true
+    },
+    {
       "name": "LSL: Analisar resultados",
       "type": "debugpy",
       "request": "launch",

@@ -55,7 +55,10 @@ def run(cfg, directory):
     for name, result in report['sensors'].items():
         print(f'{name}: received={result["received"]}/{result["expected"]}, '
               f'missing={result["missing"]}, p99={result.get("latency_ms", {}).get("p99")} ms, '
-              f'RMSE={result.get("rmse")}', flush=True)
+              f'RMSE por índice={result.get("rmse")}; '
+              f'RMSE temporal na leitura={result.get("temporal_reconstruction", {}).get("delivery", {}).get("rmse")}', flush=True)
+        for issue in result.get('issues', []):
+            print(f'  [AVISO] {name}: {issue["message"]}', flush=True)
     return report
 
 

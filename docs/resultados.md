@@ -22,7 +22,7 @@ de desempenho sob carga controlada.
 O drift medido no extremo foi **−200,04 ppm (EEG), +100,24 ppm (EMG) e −49,85 ppm (IMU)**,
 coerente com os desvios de aquisição injetados. Uma taxa mais alta produz erro de tempo
 negativo em relação à taxa nominal. Quatro casos curtos adicionais, a 100/2000 Hz
-com chunks 1/128, terminaram sem perda. Os 11 testes unitários passaram.
+com chunks 1/128, terminaram sem perda. Os testes unitários passaram.
 A campanha completa de 216 casos e o transporte entre duas máquinas não foram executados.
 
 ## Como interpretar um novo teste
@@ -42,3 +42,34 @@ Para validar sensores reais, registre um pulso físico comum nos dispositivos.
 Os dados completos ficam em `runs/`, fora do controle de versão. Para comparar
 novas execuções, guarde `config.json`, `summary.csv`, `report.json` e os PNGs;
 nas varreduras, consulte também `sweep.csv`.
+
+## Reconstrução pelo tempo e imagens
+
+Cada curva usa seu próprio vetor temporal, convertido para uma origem comum com
+um único offset inicial de relógio. Não se retiram o atraso, a variação posterior
+da correção LSL ou o início de cada curva separadamente. Na aquisição, interpola-se
+só entre amostras contíguas; na leitura, mantém-se o último valor disponível.
+Amostras de um mesmo chunk chegam juntas: não há tempos individuais observáveis
+de chegada dentro desse chunk. O RMSE temporal compara valores no **mesmo instante**.
+
+| EEG | RMSE por índice | RMSE temporal na leitura (unidades sintéticas) |
+| --- | --- | --- |
+| Isolado, sem perdas | 0 | 18,80 |
+| Extremo, com pausas e perdas | 0 nas amostras recebidas | 24,04 |
+
+Veja [EEG sem perdas](imagens/eeg_normal.png), [EEG extremo](imagens/eeg_extremo.png)
+e [alinhamento dos marcadores no extremo](imagens/sync_extremo.png).
+
+**Drift crescente:** `configs/drift.json` injeta um desvio de frequência que cresce
+1000 ppm/s. Na execução de 12 s, as 6000 amostras chegaram intactas, mas o erro
+acumulado foi **−71,11 ms** e o drift local foi de **−985 a −10820 ppm**.
+É instabilidade de aquisição simulada, não drift provocado pela rede.
+
+![Reconstrução temporal e drift crescente](imagens/drift_crescente.png)
+
+Os alertas usam limites ilustrativos: p99 de 100 ms, jitter de 10 ms, drift de
+100 ppm, acúmulo de 1 ms e crescimento de atraso de 20 ms. Ajuste esses valores
+no objeto `analysis_limits` do JSON (`latency_ms`, `jitter_ms`, `drift_ppm`,
+`accumulated_ms`, `latency_growth_ms`) para os requisitos do seu experimento.
+Limites não excedidos não certificam sincronização física. Agora são **20 testes
+unitários**, incluindo sinal intacto atrasado e drift crescente.

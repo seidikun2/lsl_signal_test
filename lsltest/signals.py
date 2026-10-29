@@ -2,6 +2,20 @@
 import numpy as np
 
 
+def sample_elapsed(nominal, sensor):
+    """Invert acquisition phase for a linearly changing frequency offset.
+
+    nominal = scale * elapsed + 0.5 * slope * elapsed**2.
+    Rationalized quadratic root also works for zero slope.
+    """
+    scale = 1+sensor['drift_ppm']*1e-6
+    ramp = sensor.get('drift_slope_ppm_s', 0.)*1e-6
+    discriminant = scale**2+2*ramp*np.asarray(nominal)
+    if np.any(discriminant <= 0):
+        raise ValueError('Acquisition rate would reach zero during the experiment')
+    return 2*np.asarray(nominal)/(scale+np.sqrt(discriminant))
+
+
 def pilot(t):
     """Common coded 40-ms pulse every second, beginning at t=0.5 s."""
     event = np.floor(t - 0.5).astype(np.int64)

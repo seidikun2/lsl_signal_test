@@ -7,7 +7,7 @@ import numpy as np
 from pylsl import (StreamInfo, StreamInlet, StreamOutlet, local_clock,
                    resolve_byprop, cf_double64, cf_string)
 
-from .signals import signal
+from .signals import signal, sample_elapsed
 from .online import OnlineAligner
 
 
@@ -16,7 +16,7 @@ def save_json(path, data):
 
 
 def wall_duration(cfg):
-    return max(cfg['duration']/(1+s['drift_ppm']*1e-6) for s in cfg['sensors'])
+    return float(max(sample_elapsed(cfg['duration'], s) for s in cfg['sensors']))
 
 
 def transmit(cfg, run_id, directory):
@@ -54,8 +54,7 @@ def transmit(cfg, run_id, directory):
             count = int(np.ceil(cfg['duration'] * s['rate']))
             if st['next'] < count:
                 end = min(st['next']+cfg['chunk'], count)
-                sensor_scale = 1+s['drift_ppm']*1e-6
-                due.append((start+(end-1)/s['rate']/sensor_scale, s, end))
+                due.append((float(start+sample_elapsed((end-1)/s['rate'], s)), s, end))
         if event_index < len(events):
             due.append((start + events[event_index][1]/scale, None, None))
         if not due:
@@ -76,7 +75,7 @@ def transmit(cfg, run_id, directory):
         ids = np.arange(st['next'], end, dtype=np.int64)
         generated = local_clock()
         values = signal(s['kind'], ids, s['rate'], s['channels'])
-        ts = start + ids/s['rate']/(1+s['drift_ppm']*1e-6)
+        ts = start + sample_elapsed(ids/s['rate'], s)
         packet = np.column_stack((values, ids))
         sent = local_clock()
         outlets[s['name']].push_chunk(packet.tolist(), ts.tolist(), pushthrough=True)

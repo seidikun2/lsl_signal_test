@@ -24,6 +24,7 @@ Edite os JSONs em `configs/`:
 | `single.json` | EEG: 500 Hz, 8 canais |
 | `multi.json` | EEG, EMG e IMU com taxas e canais diferentes |
 | `extreme.json` | Buffer curto, receptor com pausas e drift por sensor |
+| `drift.json` | Drift de aquisição crescente, para visualizar o acúmulo |
 
 Os parâmetros principais são `rate` (Hz), `channels`, `duration` (s),
 `chunk` (amostras por envio), `inlet_buffer` (segundos de retenção) e
@@ -48,11 +49,18 @@ Abra os PNGs diretamente no VS Code; o CSV permite comparar experimentos.
 | Saída em cada pasta | O que observar |
 | --- | --- |
 | `SENSOR.png` | Sinal transmitido/recebido, atraso, jitter e drift acumulado |
+| `SENSOR_tempo.png` / `diagnostico.md` | Reconstrução por timestamps e alertas de problemas |
 | `sync.png` | Diferença temporal entre amostras e marcadores por sensor |
 | `summary.csv` / `report.json` | Perdas, duplicações, RMSE, p95/p99 e drift em ppm |
 | `tx_*.npz` / `rx_*.npz` | Valores e timestamps para outras análises |
 | `online.npz` | Sensores alinhados numa grade temporal comum |
 | `config.json` | Parâmetros usados naquele teste |
+
+**Comece por `SENSOR_tempo.png`:** compara os sinais no mesmo instante, usando seus
+próprios vetores de tempo, sem retirar o atraso. `SENSOR_recon.npz` salva essa
+reconstrução; `SENSOR_janelas.csv` mostra a evolução do drift e do atraso.
+RMSE por índice zero significa valores intactos, não chegada no momento correto.
+Os alertas usam limites ilustrativos, ajustáveis em `analysis_limits` no JSON.
 
 **Resultados já medidos e interpretação:** [resultados.md](docs/resultados.md).
 

@@ -1,0 +1,9 @@
+{
+  "duration": 12,
+  "chunk": 8,
+  "inlet_buffer": 60,
+  "sensors": [
+    {"name": "eeg", "kind": "EEG", "rate": 500, "channels": 4,
+     "drift_ppm": 0, "drift_slope_ppm_s": 1000}
+  ]
+}

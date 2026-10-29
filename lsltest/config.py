@@ -28,6 +28,12 @@ def validate(config):
         s.setdefault('drift_ppm', cfg['drift_ppm'])
         if not math.isfinite(s['drift_ppm']) or abs(s['drift_ppm']) >= 100000:
             raise ValueError('Sensor abs(drift_ppm) must be < 100000')
+        ramp = s.setdefault('drift_slope_ppm_s', 0.)
+        if not math.isfinite(ramp):
+            raise ValueError('drift_slope_ppm_s must be finite')
+        # The phase inversion must stay on its positive-rate branch.
+        if (1+s['drift_ppm']*1e-6)**2+2*ramp*1e-6*(cfg['duration']+1/s['rate']) <= 0:
+            raise ValueError('Acquisition rate would reach zero during the experiment')
     if len(set(names)) != len(names):
         raise ValueError('Sensor names must be unique')
     cfg.setdefault('online_rate', max(s['rate'] for s in cfg['sensors']))
