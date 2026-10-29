@@ -76,7 +76,7 @@ def receive(cfg, run_id, directory):
         corrections.append(dict(stream=name, measured=local_clock(), offset=correction))
     marker_log = []
     begin = local_clock()
-    aligner = OnlineAligner(cfg['sensors'], cfg['online_rate'], cfg['online_lag'])
+    aligner = OnlineAligner(cfg['sensors'], cfg['online_rate'], cfg['online_lag']) if cfg.get('online_align', False) else None
     online_times, online_values = [], {s['name']: [] for s in cfg['sensors']}
     marker_duration = cfg['duration']/(1+cfg['drift_ppm']*1e-6)
     deadline = begin + cfg['start_delay'] + max(wall_duration(cfg), marker_duration) + 30
@@ -121,8 +121,9 @@ def receive(cfg, run_id, directory):
                 st['corrected'].append(np.asarray(ts)+c)
                 st['arrival'].append(np.full(len(ts), arrival))
                 st['correction'].append(np.full(len(ts), c))
-                aligner.add(name, np.asarray(ts)+c, data[:, :-1])
-            aligned = aligner.pull(local_clock())
+                if aligner is not None:
+                    aligner.add(name, np.asarray(ts)+c, data[:, :-1])
+            aligned = aligner.pull(local_clock()) if aligner is not None else None
             if aligned is not None:
                 grid, values = aligned
                 online_times.append(grid)

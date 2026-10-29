@@ -1,6 +1,5 @@
 """Execute este arquivo: gera, recebe, grava e analisa a transmissão."""
 import argparse
-import csv
 import itertools
 import json
 import multiprocessing as mp
@@ -80,40 +79,30 @@ def main():
     kind = sweep['sensor'].upper()
     cases = []
     sensor = next((s for s in cfg['sensors'] if s['kind'].upper() == kind), {})
-    for rate, channels, chunk, repeat in itertools.product(
-            sweep['frequencias'], sweep['canais'], sweep['chunks'], range(repeats)):
-        case = dict(cfg, chunk=chunk, online_rate=max(rate, cfg['online_rate']),
+    for rate, channels, chunk, buffer, pause, repeat in itertools.product(
+            sweep['frequencias'], sweep['canais'], sweep['chunks'],
+            sweep.get('buffers_s', [cfg['inlet_buffer']]), sweep.get('pausas_s', [cfg['receiver_pause']]), range(repeats)):
+        case = dict(cfg, chunk=chunk, inlet_buffer=buffer, receiver_pause=pause, online_rate=max(rate, cfg['online_rate']),
                     sensors=[dict(sensor, name=kind.lower(), kind=kind, rate=rate, channels=channels)])
-        cases.append((f'f{rate:g}c{channels}b{chunk}r{repeat+1}', validate(case)))
+        cases.append((f'f{rate:g}c{channels}b{chunk}q{buffer:g}p{pause:g}r{repeat+1}', validate(case)))
     if not cases:
-        raise ValueError('A varredura precisa ter frequencias, canais e chunks')
+        raise ValueError('As listas da varredura não podem ficar vazias')
     root = fresh(out)
     print(f'{len(cases)} testes; {len(cases)*cfg["duration"]/60:.1f} min só de aquisição', flush=True)
-    lines = ['# Sumário da varredura', '',
-             '| Teste | Estado | Perdas | Atraso p99 (ms) | Drift (ppm) |',
-             '| --- | --- | --- | --- | --- |']
-    failures = 0
-    with (root/'sumario.csv').open('w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['teste', 'estado', 'perdas', 'p99_ms', 'drift_ppm', 'erro'])
-        writer.writeheader()
-        for name, case in cases:
-            try:
-                result = run(case, root/name)['sensors'][kind.lower()]
-                row = dict(teste=name, estado='concluído', perdas=result['missing'],
-                           p99_ms=result.get('latency_ms', {}).get('p99'), drift_ppm=result.get('rx_timing_drift_ppm'))
-                label = f'[{name}]({name}/sumario.md)'
-            except Exception as error:
-                failures += 1
-                row = dict(teste=name, estado='falhou', erro=str(error))
-                label = name
-                print(f'{name}: {error}', flush=True)
-            writer.writerow(row)
-            f.flush()
-            p99 = f'{row["p99_ms"]:.2f}' if row.get('p99_ms') is not None else '—'
-            drift = f'{row["drift_ppm"]:.2f}' if row.get('drift_ppm') is not None else '—'
-            lines.append(f'| {label} | {row["estado"]} | {row.get("perdas", "—")} | '
-                         f'{p99} | {drift} |')
-            (root/'sumario.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
+    from codigo.analise import case_result, write_comparison
+    rows, links, failures = [], {}, 0
+    for name, case in cases:
+        sensor = case['sensors'][0]
+        try:
+            result = run(case, root/name)['sensors'][kind.lower()]
+            rows.append(case_result(name, case, sensor, result))
+            links[name] = f'{name}/sumario.md'
+        except Exception as error:
+            failures += 1
+            rows.append(case_result(name, case, sensor, error=str(error)))
+            print(f'{name}: {error}', flush=True)
+        write_comparison(root, rows, 'Comparação dos casos', links, plot=False)
+    write_comparison(root, rows, 'Comparação dos casos', links)
     if failures:
         raise RuntimeError(f'{failures} testes falharam; consulte {root}/sumario.csv')
 

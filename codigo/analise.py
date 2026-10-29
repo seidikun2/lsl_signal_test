@@ -194,11 +194,120 @@ def compare(tx, rx, rate):
         tx_accumulated_drift_ms=float(timing_tx[-1]*1000),
         rx_accumulated_drift_ms=float(timing_rx[-1]*1000),
         arrival_accumulated_error_ms=float(read_error[-1]*1000),
+        delivery_drift_ppm=slope(elapsed, read_error)*1e6 if len(common)>1 else None,
         latency_change_ms=float((latency[-1]-latency[0])*1000))
     return metrics, dict(common=common, it=it, ir=ir, elapsed=elapsed,
                          latency=latency, queue=queue, timing_tx=timing_tx,
                          timing_rx=timing_rx, timestamp_error=timestamp_error,
                          read_error=read_error)
+
+
+def case_result(name, cfg, sensor, metrics=None, error=''):
+    """One observable result per case/sensor; failed measurements stay missing."""
+    m = metrics or {}
+    codes = [issue['code'] for issue in m.get('issues', [])]
+    limit = m.get('limits', {**DEFAULT_LIMITS, **cfg.get('analysis_limits', {})})
+    delivery = m.get('arrival_accumulated_error_ms')
+    if delivery is not None and abs(delivery) > limit['accumulated_ms']:
+        codes.append('delivery_variation')
+    return dict(caso=name, sensor=sensor['name'], estado='falhou' if error else 'concluído',
+        hz=sensor['rate'], canais=sensor['channels'], chunk=cfg['chunk'], buffer_s=cfg['inlet_buffer'],
+        pausa_s=cfg['receiver_pause'], duracao_s=cfg['duration'],
+        drift_injetado_ppm=sensor.get('drift_ppm', cfg['drift_ppm']),
+        crescimento_injetado_ppm_s=sensor.get('drift_slope_ppm_s', 0),
+        recebidas=m.get('received'), previstas=m.get('expected'), perdas=m.get('missing'),
+        atraso_p99_ms=m.get('latency_ms', {}).get('p99'), jitter_ms=m.get('latency_ms', {}).get('std'),
+        drift_origem_ppm=m.get('tx_timing_drift_ppm'),
+        drift_aquisicao_ppm=m.get('rx_timing_drift_ppm'),
+        drift_acumulado_ms=m.get('rx_accumulated_drift_ms'),
+        desvio_entrega_ms=delivery, tendencia_entrega_ppm=m.get('delivery_drift_ppm'),
+        variacao_atraso_ms=m.get('latency_change_ms'), rmse_amostras=m.get('rmse'),
+        rmse_temporal=m.get('temporal_reconstruction', {}).get('delivery', {}).get('rmse'),
+        alerta_drift=abs(m['rx_timing_drift_ppm'])>limit['drift_ppm'] if m.get('rx_timing_drift_ppm') is not None else None,
+        alertas=';'.join(codes), erro=error,
+        limite_atraso_ms=limit['latency_ms'], limite_drift_ppm=limit['drift_ppm'],
+        limite_acumulo_ms=limit['accumulated_ms'])
+
+
+def write_comparison(out, rows, title='Sumário dos casos', links=None, plot=True):
+    """A readable table and four measured panels; no time realignment or fitting."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    out = Path(out)
+    figures = out/'figuras'
+    figures.mkdir(exist_ok=True)
+    with (out/'sumario.csv').open('w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    def number(value):
+        return '—' if value is None else f'{value:.2f}'
+    labels = dict(latency='atraso', jitter='jitter', drift='drift aquis.', accumulated_drift='acúmulo',
+        loss='perdas', growing_drift='drift crescente', latency_growth='atraso crescente',
+        delivery_variation='entrega variável', no_samples='sem dados')
+    lines = [f'# {title}', '',
+        'Observação ingênua: sem compensar atraso, alinhar inícios ou corrigir a reconstrução.',
+        'Timestamps de aquisição corrigidos pelo LSL são separados dos tempos de leitura; o atraso de entrega é preservado.', '',
+        '| Caso | Condições: Hz / canais / chunk / buffer / pausa | Atraso p99 (ms) | Drift aquisição (ppm) | Acúmulo aquisição (ms) | Desvio entrega (ms) | Perdas | Indicações |',
+        '| --- | --- | --- | --- | --- | --- | --- | --- |']
+    for row in rows:
+        name = row['caso'] if row['caso'] == row['sensor'] else row['caso']+' / '+row['sensor']
+        if links and row['caso'] in links:
+            name = f'[{name}]({links[row["caso"]]})'
+        conditions = f'{row["hz"]:g} / {row["canais"]} / {row["chunk"]} / {row["buffer_s"]:g}s / {row["pausa_s"]:g}s'
+        issues = ', '.join(labels.get(code, code) for code in row['alertas'].split(';') if code)
+        issues = 'FALHOU: '+row['erro'].replace('|', '/').replace('\n', ' ') if row['erro'] else issues or 'sem limite excedido'
+        drift = number(row['drift_aquisicao_ppm'])+(' **(!)**' if row['alerta_drift'] else '')
+        lines.append(f'| {name} | {conditions} | {number(row["atraso_p99_ms"])} | {drift} | '
+                     f'{number(row["drift_acumulado_ms"])} | {number(row["desvio_entrega_ms"])} | {row["perdas"] if row["perdas"] is not None else "—"} | {issues} |')
+    for start in range(0, len(rows) if plot else 0, 16):
+        page = rows[start:start+16]
+        fig, axes = plt.subplots(2, 2, sharey=True, figsize=(16, max(6, .7*len(page)+2)), constrained_layout=True)
+        y = np.arange(len(page))
+        names = [f'{r["caso"]} / {r["sensor"]}\n{r["hz"]:g}Hz; {r["canais"]}ch; chunk={r["chunk"]}; '
+                 f'buf={r["buffer_s"]:g}s; pausa={r["pausa_s"]:g}s' for r in page]
+        panels = [('atraso_p99_ms', 'Atraso p99 (ms)', 'limite_atraso_ms'),
+                  ('drift_aquisicao_ppm', 'Drift de aquisição vs taxa nominal (ppm)', 'limite_drift_ppm'),
+                  ('drift_acumulado_ms', 'Drift acumulado de aquisição (ms)', 'limite_acumulo_ms'),
+                  ('desvio_entrega_ms', 'Erro de entrega acumulado vs taxa nominal (ms)', 'limite_acumulo_ms')]
+        for ax, (key, label, threshold) in zip(axes.flat, panels):
+            for i, row in enumerate(page):
+                value = row[key]
+                if value is None:
+                    ax.text(0, i, 'falhou / sem medida', va='center', color='gray')
+                else:
+                    color = 'firebrick' if abs(value)>row[threshold] else 'steelblue'
+                    ax.barh(i, value, color=color)
+                    ax.annotate(f'{value:.2f}', (value, i), xytext=(3 if value>=0 else -3, 0),
+                                textcoords='offset points', ha='left' if value>=0 else 'right', va='center', fontsize=8)
+                    if key == 'drift_aquisicao_ppm' and row['drift_origem_ppm'] is not None:
+                        ax.scatter(row['drift_origem_ppm'], i, marker='D', facecolors='none', edgecolors='black', s=30, zorder=3)
+            ax.set_yticks(y, names, fontsize=7)
+            ax.set_xlabel(label)
+            limits = {r[threshold] for r in page}
+            ax.set_title(f'Limite de referência: {next(iter(limits)):g} (em módulo)' if len(limits)==1 else 'Limites de referência variam por caso', fontsize=9)
+            ax.axvline(0, color='gray', lw=.5)
+            ax.grid(axis='x', alpha=.2)
+            ax.margins(x=.25)
+            low, high = ax.get_xlim()
+            ax.set_xlim(low-.1*(high-low), high+.1*(high-low))
+        axes[0, 0].set_ylim(len(page)-.5, -.5)
+        fig.suptitle(title+' — vermelho: limite excedido; losango: drift na origem TX', fontsize=12)
+        filename = f'comparacao_{start//16+1:02}.png'
+        fig.savefig(figures/filename, dpi=120)
+        plt.close(fig)
+        lines += ['', f'![Comparação dos casos](figuras/{filename})']
+    injected = [f'{r["caso"]}/{r["sensor"]}: {r["drift_injetado_ppm"]:g} ppm; crescimento {r["crescimento_injetado_ppm_s"]:g} ppm/s'
+                for r in rows if r['drift_injetado_ppm'] or r['crescimento_injetado_ppm_s']]
+    lines += ['', '**Drift injetado:** '+('; '.join(injected) if injected else 'zero em todos os casos.'),
+        '', 'Desvio de entrega inclui filas, fase dos chunks, pausas e agendamento: não é drift puro de relógio.',
+        'Drift de aquisição RX é estimado dos timestamps LSL corrigidos contra a taxa nominal; ruído de correção pesa em testes curtos.',
+        'O losango mostra o drift medido nos timestamps de origem; o CSV guarda as duas estimativas.',
+        'Acúmulo é a diferença temporal desde a primeira amostra pareada, não a soma dos atrasos.',
+        '(!) marca drift de aquisição acima do limite. Os valores são estimativas; nenhum limite excedido não prova sincronização.',
+        'O CSV também inclui jitter, variação de atraso, erro de amplitude e duração de cada caso.']
+    (out/'sumario.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
 
 
 def plot_diagnostics(out, name, sensor, cfg, tx, rx, data, reconstructed, metrics, trends):
@@ -278,7 +387,6 @@ def analyze(directory, tx_directory=None):
     anchor_offset = next((o['offset'] for o in observations if o['stream'] != 'markers'), None)
     report['clock_anchor'] = dict(tx_origin=txmeta['start'], rx_minus_tx_initial=anchor_offset,
         method='Fixed initial LSL clock offset; no per-signal start alignment or delay removal')
-    rows = []
     rxmarkers = json.loads((recorded/'rx_markers.json').read_text())
     txmarkers = json.loads((source/'tx_markers.json').read_text())
     expected_markers = {(e['kind'], e['id']) for e in txmarkers}
@@ -312,14 +420,6 @@ def analyze(directory, tx_directory=None):
                 writer.writerows(trends)
         else:
             metrics['issues'], metrics['limits'] = diagnose(metrics, [], cfg.get('analysis_limits'))
-        rows.append(dict(sensor=name, rate=s['rate'], channels=s['channels'], chunk=cfg['chunk'],
-                         expected=metrics['expected'], received=metrics['received'], missing=metrics['missing'],
-                         p99_ms=metrics.get('latency_ms', {}).get('p99'), rmse=metrics.get('rmse'),
-                         drift_ppm=metrics.get('rx_timing_drift_ppm'),
-                         accumulated_ms=metrics.get('rx_accumulated_drift_ms'),
-                         temporal_acquisition_rmse=metrics.get('temporal_reconstruction', {}).get('acquisition', {}).get('rmse'),
-                         temporal_delivery_rmse=metrics.get('temporal_reconstruction', {}).get('delivery', {}).get('rmse'),
-                         issues=';'.join(f['code'] for f in metrics['issues'])))
         if data is None:
             continue
         aligned_events = []
@@ -356,40 +456,22 @@ def analyze(directory, tx_directory=None):
         'Corrected latency depends on LSL clock estimation and is not a hardware latency measurement.',
         'TX and RX timestamp equality validates transport, not independent physical synchronization.',
         'Timing drift is relative to nominal acquisition rate; latency trend is not clock drift.',
-        'online.npz is causal linear interpolation without extrapolation; missing intervals are NaN.',
+        'Naive mode records delivery times; online interpolation is disabled unless explicitly enabled.',
         'Signals are synthetic, with a common coded pilot; units are illustrative.',
         'Temporal reconstruction uses each series timestamps on a shared grid, without delay compensation.',
         'Delivery reconstruction holds the latest available sample per read; within-chunk arrival times are not observable.',
         'Issue thresholds are illustrative configurable limits, not sensor requirements or physical certification.'
     ]
     (recorded/'report.json').write_text(json.dumps(report, indent=2, allow_nan=False))
-    with (out/'sumario.csv').open('w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-    lines = ['# Sumário da transmissão', '',
-             'Reconstrução em uma origem comum, sem remover atraso ou alinhar inícios individualmente.', '',
-             '| Sensor | Recebidas/previstas | Perdas | RMSE por índice | RMSE temporal na leitura | Atraso p99 (ms) | Drift (ppm) | Drift acumulado (ms) |',
-             '| --- | --- | --- | --- | --- | --- | --- | --- |']
-    def number(value):
-        return f'{value:.4g}' if value is not None else 'indisponível'
-    for row in rows:
-        lines.append(f'| {row["sensor"]} | {row["received"]}/{row["expected"]} | {row["missing"]} | {number(row["rmse"])} | '
-                     f'{number(row["temporal_delivery_rmse"])} | {number(row["p99_ms"])} | {number(row["drift_ppm"])} | {number(row["accumulated_ms"])} |')
-    for name, metrics in report['sensors'].items():
-        lines += ['', f'**{name}** — [Ver figura](figuras/{name}.png)']
-        lines += ['- '+issue['message'] for issue in metrics['issues']] or ['- Nenhum limite configurado excedido.']
-    if (figures/'sync.png').exists():
-        lines += ['', '[Alinhamento dos marcadores](figuras/sync.png)']
-    lines += ['', f'Marcadores: {report["markers"]["received"]}/{report["markers"]["expected"]} recebidos; '
-              f'{report["markers"]["missing"]} perdidos; {report["markers"]["duplicates"]} duplicados.',
-              f'Conclusão: transmissor={txmeta["complete"]}, receptor={rxmeta["complete"]}.']
-    lines += ['', 'Os detalhes e limites estão em `dados/report.json` e podem ser alterados com `analysis_limits` em configuracao.py.',
-              'RMSE temporal usa valores no mesmo instante; RMSE por índice mede apenas preservação de amplitude.',
-              'Leitura é o fim de pull_chunk no Python, não chegada física ao sensor ou à interface de rede.',
-              'Drift acumulado é diferença temporal desde a primeira amostra pareada, não soma dos atrasos.',
-              'Latência crescente pode indicar filas; não é, por si só, drift de relógio.']
-    (out/'sumario.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
+    case_rows = [case_result(sensor['name'], cfg, sensor, report['sensors'][sensor['name']])
+                 for sensor in cfg['sensors']]
+    links = {sensor['name']: f"figuras/{sensor['name']}.png" for sensor in cfg['sensors']}
+    write_comparison(out, case_rows, 'Sumário da transmissão', links)
+    with (out/'sumario.md').open('a', encoding='utf-8') as f:
+        f.write(f"\nMarcadores: {report['markers']['received']}/{report['markers']['expected']} recebidos; "
+                f"{report['markers']['missing']} perdidos.\n")
+        if (figures/'sync.png').exists():
+            f.write('\n[Comparar sinais e marcadores](figuras/sync.png)\n')
     return report
 
 

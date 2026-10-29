@@ -16,7 +16,7 @@ Em `configuracao.py`, edite a duração, a frequência (`rate`) e os canais (`ch
 de EEG, EMG e IMU. `chunk` é o agrupamento em amostras; `inlet_buffer` é a retenção
 em segundos. Remova da lista os sensores que não quiser testar.
 
-Para testar combinações de frequências, canais e chunks, altere `VARREDURA["ativar"]`
+Para testar combinações de frequências, canais, chunks, buffers e pausas, altere `VARREDURA["ativar"]`
 para `True` e ajuste as listas no mesmo arquivo. O comando continua `python main.py`.
 
 ## Arquivos e resultados
@@ -35,6 +35,12 @@ resultados/
 
 [Exemplo de sumário e figuras](resultados/exemplo/sumario.md).
 No VS Code, **Ctrl+Shift+V** mostra o sumário formatado.
+
+O sumário compara as condições de cada caso e marca limites excedidos. Em
+`figuras/comparacao_01.png`, veja atraso, drift de aquisição, acúmulo e desvio
+de entrega lado a lado. Atraso variável por chunks/filas não é drift de relógio.
+O modo padrão apenas grava e observa: não aplica alinhamento online nem remove
+atrasos. Deixe o drift injetado em zero para investigar os efeitos do transporte.
 
 A reconstrução usa o vetor temporal de cada sinal, sem remover o atraso.
 Valores intactos podem chegar atrasados. Os limites de alerta são editáveis;

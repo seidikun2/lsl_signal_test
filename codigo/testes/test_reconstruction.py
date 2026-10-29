@@ -102,3 +102,42 @@ def test_reject_drift_ramp_that_stops_acquisition():
     with pytest.raises(ValueError, match='reach zero'):
         validate(dict(duration=12, sensors=[dict(name='eeg', kind='EEG', rate=100,
                       channels=1, drift_slope_ppm_s=-100000)]))
+
+
+def test_summary_distinguishes_constant_delay_from_acquisition_drift():
+    from codigo.analise import case_result
+    from codigo.config import validate
+    cfg = validate(dict(sensors=[dict(name='eeg', kind='EEG', rate=100, channels=1)]))
+    tx, rx = fixture(delay=.2)
+    metrics, data = compare(tx, rx, 100)
+    metrics['issues'], metrics['limits'] = diagnose(metrics, windows(data['elapsed'], data['latency'], data['timing_rx']))
+    row = case_result('C01', cfg, cfg['sensors'][0], metrics)
+    assert row['atraso_p99_ms'] == pytest.approx(200.)
+    assert row['drift_aquisicao_ppm'] == pytest.approx(0., abs=1e-6)
+    assert row['desvio_entrega_ms'] == pytest.approx(0., abs=1e-6)
+    assert row['alerta_drift'] is False
+    assert row['drift_injetado_ppm'] == 0
+    assert 'latency' in row['alertas']
+
+
+def test_growing_delivery_delay_is_not_reported_as_acquisition_clock_drift(tmp_path):
+    import csv
+    from codigo.analise import case_result, write_comparison
+    from codigo.config import validate
+    cfg = validate(dict(sensors=[dict(name='eeg', kind='EEG', rate=100, channels=1)]))
+    tx, rx = fixture(delay=.2)
+    rx['arrival'] += tx['ids']/100 * .02
+    metrics, data = compare(tx, rx, 100)
+    metrics['issues'], metrics['limits'] = diagnose(metrics, windows(data['elapsed'], data['latency'], data['timing_rx']))
+    row = case_result('C01', cfg, cfg['sensors'][0], metrics)
+    assert row['alerta_drift'] is False
+    assert row['desvio_entrega_ms'] == pytest.approx(199.8)
+    assert row['tendencia_entrega_ppm'] == pytest.approx(20000.)
+    assert 'delivery_variation' in row['alertas']
+    failed = case_result('C02', cfg, cfg['sensors'][0], error='stream indisponível')
+    write_comparison(tmp_path, [row, failed])
+    assert (tmp_path/'figuras/comparacao_01.png').is_file()
+    rows = list(csv.DictReader((tmp_path/'sumario.csv').open()))
+    assert rows[1]['estado'] == 'falhou'
+    assert rows[1]['drift_aquisicao_ppm'] == ''  # missing, never a fictitious zero
+    assert 'FALHOU' in (tmp_path/'sumario.md').read_text()
