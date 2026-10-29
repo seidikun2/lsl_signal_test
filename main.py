@@ -1,27 +1,19 @@
+"""Executa gerador, receptor e análise; também organiza varreduras de parâmetros."""
 import argparse
 import itertools
-import json
 import multiprocessing as mp
 import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
-from .config import load, validate
-
-
-def fresh(path):
-    out = Path(path)
-    if out.exists() and any(out.iterdir()):
-        raise ValueError(f'Output directory is not empty: {out}')
-    out.mkdir(parents=True, exist_ok=True)
-    return out
+from config import load, validate, fresh, save_json, wall_duration
 
 
 def run(cfg, directory):
-    from .transport import transmit, receive, save_json, wall_duration
-    from .analysis import analyze
+    from gerador import transmit
+    from receptor import receive
+    from analise import analyze
     out = fresh(directory)
     run_id = uuid.uuid4().hex[:12]
     save_json(out/'config.json', cfg)
@@ -63,17 +55,14 @@ def run(cfg, directory):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ('--config', '--out'):
+        argv.insert(0, 'run')
     parser = argparse.ArgumentParser(description='LSL signal/marker stress laboratory')
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('run', 'tx', 'rx'):
-        p = sub.add_parser(name)
-        p.add_argument('--config', default='configs/single.json')
-        p.add_argument('--out', required=name != 'run')
-        if name in ('tx', 'rx'):
-            p.add_argument('--id', required=True, help='Same unique ID on both hosts')
-    p = sub.add_parser('analyze')
-    p.add_argument('directory')
-    p.add_argument('--tx-dir', help='Transmitter log directory, if on another host')
+    p = sub.add_parser('run', help='Executar gerador, receptor e análise')
+    p.add_argument('--config', default='configs/single.json')
+    p.add_argument('--out')
     p = sub.add_parser('sweep')
     p.add_argument('--rates', nargs='+', type=float, default=[100, 250, 500, 1000, 1500, 2000])
     p.add_argument('--channels', nargs='+', type=int, default=[1, 8, 32])
@@ -87,11 +76,7 @@ def main(argv=None):
     p.add_argument('--out')
     args = parser.parse_args(argv)
     stamp = datetime.now(timezone.utc).strftime('%y%m%d_%H%M%S')
-    if args.command == 'analyze':
-        from .analysis import analyze
-        report = analyze(args.directory, args.tx_dir)
-        print(json.dumps(report, indent=2))
-    elif args.command == 'sweep':
+    if args.command == 'sweep':
         if args.repeats < 1:
             parser.error('--repeats must be positive')
         root = fresh(args.out or f'runs/swp_{stamp}')
@@ -123,12 +108,7 @@ def main(argv=None):
             raise RuntimeError(f'{failures} cases failed; see {root}/sweep.csv')
     else:
         cfg = load(args.config)
-        if args.command == 'run':
-            run(cfg, args.out or f'runs/run_{stamp}')
-        else:
-            from .transport import transmit, receive
-            out = fresh(args.out)
-            (transmit if args.command == 'tx' else receive)(cfg, args.id, out)
+        run(cfg, args.out or f'runs/run_{stamp}')
 
 
 if __name__ == '__main__':

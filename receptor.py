@@ -1,95 +1,58 @@
-"""Real LSL outlets/inlets, explicit timestamps and unmodified receiver clocks."""
+"""Recebe streams LSL, registra tempos e valores e salva a aquisição."""
+import argparse
 import json
 import time
 from pathlib import Path
 
 import numpy as np
-from pylsl import (StreamInfo, StreamInlet, StreamOutlet, local_clock,
-                   resolve_byprop, cf_double64, cf_string)
-
-from .signals import signal, sample_elapsed
-from .online import OnlineAligner
+from pylsl import StreamInlet, local_clock, resolve_byprop
+from config import load, fresh, save_json, wall_duration
 
 
-def save_json(path, data):
-    Path(path).write_text(json.dumps(data, indent=2, allow_nan=False))
+class OnlineAligner:
+    def __init__(self, sensors, rate, lag=.25):
+        self.rate, self.lag, self.next_time = rate, lag, None
+        self.rates = {s['name']: s['rate'] for s in sensors}
+        self.data = {s['name']: (np.empty(0), np.empty((0, s['channels']))) for s in sensors}
 
+    def add(self, name, timestamps, values):
+        old_t, old_y = self.data[name]
+        if not len(timestamps):
+            return
+        # A backward correction supersedes buffered data at the new timestamps.
+        cut = np.searchsorted(old_t, timestamps[0], side='left')
+        old_t, old_y = old_t[:cut], old_y[:cut]
+        t = np.concatenate((old_t, timestamps))
+        y = np.concatenate((old_y, values))
+        # A clock correction step can produce nonmonotonic timestamps. Keep the
+        # newest strictly increasing sequence; do not interpolate across a reversal.
+        keep = np.r_[True, t[1:] > np.maximum.accumulate(t[:-1])]
+        self.data[name] = t[keep], y[keep]
 
-def wall_duration(cfg):
-    return float(max(sample_elapsed(cfg['duration'], s) for s in cfg['sensors']))
-
-
-def transmit(cfg, run_id, directory):
-    out = Path(directory)
-    out.mkdir(parents=True, exist_ok=True)
-    save_json(out / 'config.json', cfg)
-    outlets, states = {}, {}
-    for s in cfg['sensors']:
-        info = StreamInfo(f'{run_id}_{s["name"]}', s['kind'], s['channels']+1,
-                          s['rate'], cf_double64, f'{run_id}:{s["name"]}')
-        info.desc().append_child_value('validation_index_channel', str(s['channels']))
-        info.desc().append_child_value('signal_channels', str(s['channels']))
-        info.desc().append_child_value('synthetic', 'true')
-        outlets[s['name']] = StreamOutlet(info, chunk_size=0, max_buffered=cfg['inlet_buffer'])
-        states[s['name']] = dict(next=0, ids=[], values=[], sample=[], generated=[], sent=[])
-    markers = StreamOutlet(StreamInfo(f'{run_id}_markers', 'Markers', 1, 0,
-                                      cf_string, f'{run_id}:markers'))
-    # No samples are sent until every inlet has connected.
-    deadline = time.monotonic() + 45
-    while not (markers.have_consumers() and all(o.have_consumers() for o in outlets.values())):
-        if time.monotonic() > deadline:
-            raise TimeoutError('Not all receivers connected within 45 s')
-        time.sleep(.02)
-    start = local_clock() + cfg['start_delay']
-    scale = 1 + cfg['drift_ppm'] * 1e-6
-    events = [('start', 0., -1)] + [('sync', float(t), i) for i, t in
-              enumerate(np.arange(.5, cfg['duration'], 1.))] + [('end', max(cfg['duration'], wall_duration(cfg)*scale), -2)]
-    event_index = 0
-    marker_log = []
-    save_json(out / 'tx_meta.json', dict(run_id=run_id, start=start, complete=False))
-    while True:
-        due = []
-        for s in cfg['sensors']:
-            st = states[s['name']]
-            count = int(np.ceil(cfg['duration'] * s['rate']))
-            if st['next'] < count:
-                end = min(st['next']+cfg['chunk'], count)
-                due.append((float(start+sample_elapsed((end-1)/s['rate'], s)), s, end))
-        if event_index < len(events):
-            due.append((start + events[event_index][1]/scale, None, None))
-        if not due:
-            break
-        when, s, end = min(due, key=lambda x: x[0])
-        remaining = when-local_clock()
-        if remaining > 0:
-            time.sleep(remaining)
-        if s is None:
-            kind, nominal, event_id = events[event_index]
-            sent = local_clock()
-            payload = dict(kind=kind, id=event_id, nominal=nominal, sample_time=when, sent=sent)
-            markers.push_sample([json.dumps(payload)], timestamp=when, pushthrough=True)
-            marker_log.append(payload)
-            event_index += 1
-            continue
-        st = states[s['name']]
-        ids = np.arange(st['next'], end, dtype=np.int64)
-        generated = local_clock()
-        values = signal(s['kind'], ids, s['rate'], s['channels'])
-        ts = start + sample_elapsed(ids/s['rate'], s)
-        packet = np.column_stack((values, ids))
-        sent = local_clock()
-        outlets[s['name']].push_chunk(packet.tolist(), ts.tolist(), pushthrough=True)
-        for key, value in [('ids', ids), ('values', values), ('sample', ts),
-                           ('generated', np.full(len(ids), generated)), ('sent', np.full(len(ids), sent))]:
-            st[key].append(value)
-        st['next'] = end
-    for name, st in states.items():
-        np.savez_compressed(out / f'tx_{name}.npz', **{
-            key: np.concatenate(st[key]) for key in ('ids', 'values', 'sample', 'generated', 'sent')})
-    save_json(out / 'tx_markers.json', marker_log)
-    save_json(out / 'tx_meta.json', dict(run_id=run_id, start=start, complete=True))
-    # Keep outlets alive while receivers drain, including under deliberate pauses.
-    time.sleep(max(2., cfg['receiver_pause'] + 1.))
+    def pull(self, now):
+        if any(len(t) < 2 for t, _ in self.data.values()):
+            return None
+        if self.next_time is None:
+            self.next_time = np.ceil(max(t[0] for t, _ in self.data.values())*self.rate)/self.rate
+        end = min(now-self.lag, *(t[-1] for t, _ in self.data.values()))
+        n = int(np.floor((end-self.next_time)*self.rate))+1
+        if n <= 0:
+            return None
+        grid = self.next_time + np.arange(n)/self.rate
+        result = {}
+        for name, (t, y) in self.data.items():
+            values = np.column_stack([np.interp(grid, t, y[:, c], left=np.nan, right=np.nan)
+                                      for c in range(y.shape[1])])
+            right = np.searchsorted(t, grid, side='right').clip(1, len(t)-1)
+            gap = (t[right]-t[right-1]) > 1.5/self.rates[name]
+            exact = np.isclose(grid, t[right-1], rtol=0, atol=1e-9) | np.isclose(grid, t[right], rtol=0, atol=1e-9)
+            gap &= ~exact
+            values[gap] = np.nan
+            result[name] = values
+            cut = max(0, np.searchsorted(t, grid[-1])-1)
+            self.data[name] = t[cut:], y[cut:]
+        self.next_time += n/self.rate
+        return grid, result
 
 
 def receive(cfg, run_id, directory):
@@ -187,3 +150,16 @@ def receive(cfg, run_id, directory):
             inlet.close_stream()
     if not complete:
         raise TimeoutError('End marker not received; partial receiver logs were saved')
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Receber e gravar sinais LSL')
+    parser.add_argument('--config', default='configs/single.json')
+    parser.add_argument('--id', default='teste', help='Mesmo ID no gerador')
+    parser.add_argument('--out', default='runs/rx01')
+    args = parser.parse_args(argv)
+    receive(load(args.config), args.id, fresh(args.out))
+
+
+if __name__ == '__main__':
+    main()

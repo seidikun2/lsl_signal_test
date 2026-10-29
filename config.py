@@ -1,6 +1,9 @@
+"""Configuração dos experimentos e utilitários compartilhados."""
 import json
 import math
 from pathlib import Path
+
+import numpy as np
 
 
 def validate(config):
@@ -56,3 +59,35 @@ def validate(config):
 
 def load(path):
     return validate(json.loads(Path(path).read_text()))
+
+
+def sample_elapsed(nominal, sensor):
+    """Invert acquisition phase for a linearly changing frequency offset.
+
+    nominal = scale * elapsed + 0.5 * slope * elapsed**2.
+    Rationalized quadratic root also works for zero slope.
+    """
+    scale = 1+sensor['drift_ppm']*1e-6
+    ramp = sensor.get('drift_slope_ppm_s', 0.)*1e-6
+    discriminant = scale**2+2*ramp*np.asarray(nominal)
+    if np.any(discriminant <= 0):
+        raise ValueError('Acquisition rate would reach zero during the experiment')
+    return 2*np.asarray(nominal)/(scale+np.sqrt(discriminant))
+
+
+def save_json(path, data):
+    Path(path).write_text(json.dumps(data, indent=2, allow_nan=False))
+
+
+def wall_duration(cfg):
+    return float(max(sample_elapsed(cfg['duration'], s) for s in cfg['sensors']))
+
+
+def fresh(path):
+    out = Path(path)
+    if out.exists() and any(out.iterdir()):
+        raise ValueError(f'Output directory is not empty: {out}')
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+

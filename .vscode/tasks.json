@@ -5,25 +5,59 @@
       "label": "Instalar dependências",
       "type": "process",
       "command": "${command:python.interpreterPath}",
-      "args": ["-m", "pip", "install", "-e", ".[test]"],
-      "options": {"cwd": "${workspaceFolder}"},
+      "args": [
+        "-m",
+        "pip",
+        "install",
+        "-r",
+        "requirements.txt"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
       "problemMatcher": []
     },
     {
       "label": "Testar código",
       "type": "process",
       "command": "${command:python.interpreterPath}",
-      "args": ["-m", "pytest", "-q"],
-      "options": {"cwd": "${workspaceFolder}"},
-      "group": {"kind": "test", "isDefault": true},
+      "args": [
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
       "problemMatcher": []
     },
     {
       "label": "LSL: Varredura curta",
       "type": "process",
       "command": "${command:python.interpreterPath}",
-      "args": ["-m", "lsltest", "sweep", "--rates", "100", "2000", "--channels", "2", "--chunks", "1", "128", "--repeats", "1", "--duration", "2"],
-      "options": {"cwd": "${workspaceFolder}"},
+      "args": [
+        "${workspaceFolder}/main.py",
+        "sweep",
+        "--rates",
+        "100",
+        "2000",
+        "--channels",
+        "2",
+        "--chunks",
+        "1",
+        "128",
+        "--repeats",
+        "1",
+        "--duration",
+        "2"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
       "problemMatcher": []
     }
   ]

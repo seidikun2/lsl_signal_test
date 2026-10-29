@@ -5,55 +5,73 @@
       "name": "LSL: EEG",
       "type": "debugpy",
       "request": "launch",
-      "module": "lsltest",
-      "args": ["run", "--config", "configs/single.json"],
+      "args": [
+        "run",
+        "--config",
+        "configs/single.json"
+      ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true,
-      "subProcess": true
+      "subProcess": true,
+      "program": "${workspaceFolder}/main.py"
     },
     {
       "name": "LSL: Multissensor",
       "type": "debugpy",
       "request": "launch",
-      "module": "lsltest",
-      "args": ["run", "--config", "configs/multi.json"],
+      "args": [
+        "run",
+        "--config",
+        "configs/multi.json"
+      ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true,
-      "subProcess": true
+      "subProcess": true,
+      "program": "${workspaceFolder}/main.py"
     },
     {
       "name": "LSL: Extremo",
       "type": "debugpy",
       "request": "launch",
-      "module": "lsltest",
-      "args": ["run", "--config", "configs/extreme.json"],
+      "args": [
+        "run",
+        "--config",
+        "configs/extreme.json"
+      ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true,
-      "subProcess": true
+      "subProcess": true,
+      "program": "${workspaceFolder}/main.py"
     },
     {
       "name": "LSL: Drift crescente",
       "type": "debugpy",
       "request": "launch",
-      "module": "lsltest",
-      "args": ["run", "--config", "configs/drift.json"],
+      "args": [
+        "run",
+        "--config",
+        "configs/drift.json"
+      ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true,
-      "subProcess": true
+      "subProcess": true,
+      "program": "${workspaceFolder}/main.py"
     },
     {
       "name": "LSL: Analisar resultados",
       "type": "debugpy",
       "request": "launch",
-      "module": "lsltest",
-      "args": ["analyze", "${input:resultsDirectory}"],
+      "args": [
+        "${input:resultsDirectory}"
+      ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "justMyCode": true
+      "justMyCode": true,
+      "program": "${workspaceFolder}/analise.py"
     }
   ],
   "inputs": [

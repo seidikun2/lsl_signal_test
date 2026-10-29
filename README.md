@@ -1,78 +1,71 @@
 # Testes de transmissão LSL
 
-Simula EEG, EMG e IMU com marcadores, transmissor e receptor LSL separados.
-Varia taxas, canais e buffers; salva sinais, gráficos e métricas de sincronização.
+Três etapas em Python: gerar/transmitir, receber/gravar e analisar os sinais pelo tempo.
 
-## Executar no VS Code
-
-1. Abra **a pasta deste projeto** no VS Code e instale as extensões recomendadas **Python** e **Python Debugger**.
-2. Com Python 3.12 instalado, crie o ambiente no terminal: `python -m venv .venv` (ou `python3` no Linux).
-3. Use **Python: Select Interpreter** na paleta de comandos e selecione `.venv`.
-4. Use **Tasks: Run Task → Instalar dependências**. A tarefa usa o Python selecionado.
-5. Abra **Run and Debug**, escolha **LSL: EEG**, **LSL: Multissensor** ou **LSL: Extremo** e execute.
-
-Use **Ctrl+F5** para medir sem depurador e **F5** para investigar o código.
-Breakpoints e o depurador alteram a temporização. Os testes unitários aparecem
-na aba **Testing**; também há a tarefa **Testar código**.
-
-## Configurar e rodar
-
-Edite os JSONs em `configs/`:
-
-| Arquivo | Cenário |
+| Arquivo | Responsabilidade |
 | --- | --- |
-| `single.json` | EEG: 500 Hz, 8 canais |
-| `multi.json` | EEG, EMG e IMU com taxas e canais diferentes |
-| `extreme.json` | Buffer curto, receptor com pausas e drift por sensor |
-| `drift.json` | Drift de aquisição crescente, para visualizar o acúmulo |
+| `gerador.py` | Simula EEG, EMG, IMU e marcadores; transmite e salva os tempos de origem |
+| `receptor.py` | Recebe, registra tempos de leitura e salva os dados; inclui alinhamento online |
+| `analise.py` | Reconstrói pelos vetores temporais e mostra atraso, perdas e drift |
+| `main.py` | Executa as três etapas e organiza varreduras de parâmetros |
+| `config.py` | Lê os JSONs e reúne validação e pequenos utilitários compartilhados |
 
-Os parâmetros principais são `rate` (Hz), `channels`, `duration` (s),
-`chunk` (amostras por envio), `inlet_buffer` (segundos de retenção) e
-`drift_ppm` (desvio simulado da taxa, global ou por sensor).
+## Começar no VS Code
 
-No terminal com o ambiente ativado:
+Abra a pasta do projeto. Com Python 3.12 instalado, no terminal:
 
 ```bash
-python -m lsltest run --config configs/multi.json
-python -m lsltest sweep --rates 100 500 1000 2000 --channels 1 8 32 --chunks 1 16 128 --repeats 3 --duration 10
-python -m lsltest analyze runs/NOME_DO_TESTE
+python -m venv .venv
 ```
 
-Cada execução cria uma pasta em `runs/`. Na varredura, `f2000c32b128r2`
-significa 2000 Hz, 32 canais, chunk 128 e repetição 2. A tarefa **LSL: Varredura curta**
-no VS Code executa quatro casos de validação. Pastas existentes não são sobrescritas.
+Selecione `.venv` em **Python: Select Interpreter** e abra um novo terminal:
 
-## Ver os resultados
+```bash
+python -m pip install -r requirements.txt
+python main.py
+```
 
-Abra os PNGs diretamente no VS Code; o CSV permite comparar experimentos.
+Isso roda EEG por 10 s, grava e gera as figuras automaticamente.
+Também pode selecionar **LSL: EEG** em **Run and Debug** e usar **Ctrl+F5**.
+Use F5 para depurar; o depurador altera as medições de tempo.
 
-| Saída em cada pasta | O que observar |
-| --- | --- |
-| `SENSOR.png` | Sinal transmitido/recebido, atraso, jitter e drift acumulado |
-| `SENSOR_tempo.png` / `diagnostico.md` | Reconstrução por timestamps e alertas de problemas |
-| `sync.png` | Diferença temporal entre amostras e marcadores por sensor |
-| `summary.csv` / `report.json` | Perdas, duplicações, RMSE, p95/p99 e drift em ppm |
-| `tx_*.npz` / `rx_*.npz` | Valores e timestamps para outras análises |
-| `online.npz` | Sensores alinhados numa grade temporal comum |
-| `config.json` | Parâmetros usados naquele teste |
+## Outros testes
 
-**Comece por `SENSOR_tempo.png`:** compara os sinais no mesmo instante, usando seus
-próprios vetores de tempo, sem retirar o atraso. `SENSOR_recon.npz` salva essa
-reconstrução; `SENSOR_janelas.csv` mostra a evolução do drift e do atraso.
-RMSE por índice zero significa valores intactos, não chegada no momento correto.
-Os alertas usam limites ilustrativos, ajustáveis em `analysis_limits` no JSON.
+Edite taxas, canais, duração e buffers nos JSONs de `configs/`:
 
-**Resultados já medidos e interpretação:** [resultados.md](docs/resultados.md).
+```bash
+python main.py --config configs/multi.json
+python main.py --config configs/extreme.json
+python main.py --config configs/drift.json
+python main.py sweep --rates 100 2000 --channels 8 32 --chunks 1 128 --repeats 2
+```
 
-A sincronização online usa a correção de relógio do LSL e interpolação causal;
-lacunas viram `NaN`. Um pulso comum e os marcadores permitem comparar os sensores.
-O transporte inclui um canal extra de índice para detectar perdas; ele é removido dos sinais salvos.
+`chunk` é o agrupamento em amostras; `inlet_buffer` é a retenção em segundos.
+`drift_ppm` e `drift_slope_ppm_s` controlam desvio e crescimento da taxa simulada.
 
-O atraso inclui agrupamento, filas e leitura pelo Python; não mede apenas a rede.
-Os dados ficam em RAM até a gravação final: divida campanhas longas em casos menores.
-São testes de software, sem validação física dos sensores. Seu transmissor existente
-poderá ser integrado em `lsltest/transport.py`.
+Para executar manualmente, use dois terminais com a mesma configuração:
 
-Para instalar sem VS Code: ative um ambiente virtual e execute
-`python -m pip install -e ".[test]"`. O `requirements.lock` registra as versões
-validadas em Python 3.12/Linux; em outras plataformas, `pylsl` pode exigir `liblsl`.
+```bash
+# Terminal 1: gerador (espera a conexão do receptor)
+python gerador.py
+# Terminal 2: receptor
+python receptor.py
+# Quando ambos terminarem: análise
+python analise.py runs/rx01 --tx-dir runs/tx01
+```
+
+Os padrões são `configs/single.json`, ID `teste` e pastas `runs/tx01`/`runs/rx01`.
+Nas próximas execuções, escolha novas pastas com `--out`; dados não são sobrescritos.
+
+## Resultados
+
+O `main.py` cria uma pasta em `runs/`. Abra `SENSOR_tempo.png`, `sync.png` e
+`diagnostico.md`: mostram reconstrução, atraso, drift acumulado e alertas.
+`summary.csv` resume as métricas; os NPZ guardam sinais e tempos para outras análises.
+**Valores intactos não significam chegada no tempo correto:** a análise compara
+cada sinal usando seu próprio vetor temporal, sem remover o atraso.
+
+[Imagens de exemplo e resultados medidos](docs/resultados.md).
+
+Os dados ficam em RAM até a gravação final. São medições de software, não de
+latência física de sensores. Testes automatizados: `python -m pytest -q`.

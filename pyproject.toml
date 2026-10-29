@@ -7,13 +7,16 @@ name = "lsl-signal-test"
 version = "0.1.0"
 description = "LSL signal, marker and clock stress experiments"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.26", "scipy>=1.11", "matplotlib>=3.8", "pylsl>=1.17"]
+dependencies = ["numpy>=1.26", "matplotlib>=3.8", "pylsl>=1.17"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
 
 [project.scripts]
-lsl-test = "lsltest.cli:main"
+lsl-test = "main:main"
 
-[tool.setuptools.packages.find]
-include = ["lsltest*"]
+[tool.setuptools]
+py-modules = ["gerador", "receptor", "analise", "main", "config"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

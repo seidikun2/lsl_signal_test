@@ -1,10 +1,10 @@
 import numpy as np
 import pytest
 
-from lsltest.analysis import compare
-from lsltest.config import validate
-from lsltest.online import OnlineAligner
-from lsltest.signals import signal, pilot
+from analise import compare
+from config import validate
+from receptor import OnlineAligner
+from gerador import signal, pilot
 
 
 def test_loss_duplicates_order_drift_and_clock_offset():
