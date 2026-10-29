@@ -1,10 +1,10 @@
 import numpy as np
 import pytest
 
-from analise import compare
-from config import validate
-from receptor import OnlineAligner
-from gerador import signal, pilot
+from codigo.analise import compare
+from codigo.config import validate
+from codigo.receptor import OnlineAligner
+from codigo.gerador import signal, pilot
 
 
 def test_loss_duplicates_order_drift_and_clock_offset():

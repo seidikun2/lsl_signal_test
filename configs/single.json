@@ -1,6 +1,0 @@
-{
-  "duration": 10,
-  "chunk": 16,
-  "inlet_buffer": 60,
-  "sensors": [{"name": "eeg", "kind": "EEG", "rate": 500, "channels": 8}]
-}

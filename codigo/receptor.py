@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from pylsl import StreamInlet, local_clock, resolve_byprop
-from config import load, fresh, save_json, wall_duration
+from .config import load, fresh, save_json, wall_duration
 
 
 class OnlineAligner:
@@ -154,11 +154,11 @@ def receive(cfg, run_id, directory):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Receber e gravar sinais LSL')
-    parser.add_argument('--config', default='configs/single.json')
+    parser.add_argument('--config', default=str(Path(__file__).resolve().parents[1]/'configuracao.py'))
     parser.add_argument('--id', default='teste', help='Mesmo ID no gerador')
-    parser.add_argument('--out', default='runs/rx01')
+    parser.add_argument('--out', default='resultados/manual/rx')
     args = parser.parse_args(argv)
-    receive(load(args.config), args.id, fresh(args.out))
+    receive(load(args.config), args.id, fresh(args.out)/'dados')
 
 
 if __name__ == '__main__':

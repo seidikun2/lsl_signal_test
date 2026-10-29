@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from analise import compare
-from analise import temporal_reconstruction, windows, diagnose
+from codigo.analise import compare
+from codigo.analise import temporal_reconstruction, windows, diagnose
 
 
 def fixture(delay=.2, timestamp_shift=0):
@@ -36,7 +36,7 @@ def test_shifted_acquisition_timestamp_is_not_removed():
 
 
 def test_chunks_do_not_invent_per_sample_arrival_times():
-    from analise import delivery_hold
+    from codigo.analise import delivery_hold
     times = np.repeat([.04, .09], 5)
     ids = np.arange(10)
     values = ids[:, None].astype(float)
@@ -79,14 +79,14 @@ def test_time_varying_clock_correction_is_preserved():
 
 
 def test_reordered_batch_keeps_latest_acquired_sample():
-    from analise import delivery_hold
+    from codigo.analise import delivery_hold
     result = delivery_hold(np.array([1., 1., 2.]), np.array([[8.], [7.], [6.]]),
                            np.array([1., 2.]), np.array([8, 7, 6]))
     np.testing.assert_array_equal(result[:, 0], [8, 8])
 
 
 def test_acquisition_drift_ramp_obeys_frequency_model():
-    from config import sample_elapsed
+    from codigo.config import sample_elapsed
     nominal = np.arange(0., 12., .002)
     sensor = dict(drift_ppm=200., drift_slope_ppm_s=1000.)
     elapsed = sample_elapsed(nominal, sensor)
@@ -98,7 +98,7 @@ def test_acquisition_drift_ramp_obeys_frequency_model():
 
 
 def test_reject_drift_ramp_that_stops_acquisition():
-    from config import validate
+    from codigo.config import validate
     with pytest.raises(ValueError, match='reach zero'):
         validate(dict(duration=12, sensors=[dict(name='eeg', kind='EEG', rate=100,
                       channels=1, drift_slope_ppm_s=-100000)]))

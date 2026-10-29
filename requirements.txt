@@ -1,4 +1,3 @@
 numpy>=1.26
 matplotlib>=3.8
 pylsl>=1.17
-pytest>=8

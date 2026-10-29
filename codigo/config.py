@@ -1,6 +1,7 @@
 """Configuração dos experimentos e utilitários compartilhados."""
 import json
 import math
+import runpy
 from pathlib import Path
 
 import numpy as np
@@ -58,7 +59,9 @@ def validate(config):
 
 
 def load(path):
-    return validate(json.loads(Path(path).read_text()))
+    path = Path(path)
+    content = runpy.run_path(str(path))['CONFIG'] if path.suffix == '.py' else json.loads(path.read_text())
+    return validate(content)
 
 
 def sample_elapsed(nominal, sensor):

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from pylsl import StreamInfo, StreamOutlet, local_clock, cf_double64, cf_string
-from config import load, fresh, save_json, sample_elapsed, wall_duration
+from .config import load, fresh, save_json, sample_elapsed, wall_duration
 
 
 def pilot(t):
@@ -113,11 +113,11 @@ def transmit(cfg, run_id, directory):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Gerar e transmitir sinais LSL')
-    parser.add_argument('--config', default='configs/single.json')
+    parser.add_argument('--config', default=str(Path(__file__).resolve().parents[1]/'configuracao.py'))
     parser.add_argument('--id', default='teste', help='Mesmo ID no receptor')
-    parser.add_argument('--out', default='runs/tx01')
+    parser.add_argument('--out', default='resultados/manual/tx')
     args = parser.parse_args(argv)
-    transmit(load(args.config), args.id, fresh(args.out))
+    transmit(load(args.config), args.id, fresh(args.out)/'dados')
 
 
 if __name__ == '__main__':

@@ -251,7 +251,7 @@ def plot_diagnostics(out, name, sensor, cfg, tx, rx, data, reconstructed, metric
     from textwrap import fill
     fig.suptitle(f'{name}: {sensor["rate"]} Hz / {sensor["channels"]} canais / chunk {cfg["chunk"]}\n'
                  + fill(status, 105), color='darkred' if flags else 'darkgreen', fontsize=11)
-    fig.savefig(out/f'{name}_tempo.png', dpi=120)
+    fig.savefig(out/f'{name}.png', dpi=120)
     plt.close(fig)
 
 
@@ -261,21 +261,25 @@ def analyze(directory, tx_directory=None):
     import matplotlib.pyplot as plt
     out = Path(directory)
     source = Path(tx_directory) if tx_directory else out
+    source = source/'dados' if (source/'dados').is_dir() else source
+    recorded = out/'dados' if (out/'dados').is_dir() else out
+    figures = out/'figuras'
+    figures.mkdir(exist_ok=True)
     cfg = json.loads((source/'config.json').read_text())
     txmeta = json.loads((source/'tx_meta.json').read_text())
-    rxmeta = json.loads((out/'rx_meta.json').read_text())
+    rxmeta = json.loads((recorded/'rx_meta.json').read_text())
     if txmeta['run_id'] != rxmeta['run_id']:
         raise ValueError('TX and RX run IDs differ')
     report = dict(run_id=txmeta['run_id'], tx_complete=txmeta['complete'],
                   rx_complete=rxmeta['complete'], sensors={})
-    correction_path = out/'corrections.json'
+    correction_path = recorded/'corrections.json'
     observations = json.loads(correction_path.read_text()) if correction_path.exists() else []
     # One fixed domain translation for every stream, not a fit to the signals.
     anchor_offset = next((o['offset'] for o in observations if o['stream'] != 'markers'), None)
     report['clock_anchor'] = dict(tx_origin=txmeta['start'], rx_minus_tx_initial=anchor_offset,
         method='Fixed initial LSL clock offset; no per-signal start alignment or delay removal')
     rows = []
-    rxmarkers = json.loads((out/'rx_markers.json').read_text())
+    rxmarkers = json.loads((recorded/'rx_markers.json').read_text())
     txmarkers = json.loads((source/'tx_markers.json').read_text())
     expected_markers = {(e['kind'], e['id']) for e in txmarkers}
     got_markers = [(e['kind'], e['id']) for e in rxmarkers]
@@ -287,7 +291,7 @@ def analyze(directory, tx_directory=None):
         name = s['name']
         with np.load(source/f'tx_{name}.npz') as f:
             tx = dict(f)
-        with np.load(out/f'rx_{name}.npz') as f:
+        with np.load(recorded/f'rx_{name}.npz') as f:
             rx = dict(f)
         metrics, data = compare(tx, rx, s['rate'])
         report['sensors'][name] = metrics
@@ -300,9 +304,9 @@ def analyze(directory, tx_directory=None):
             trends = windows(data['elapsed'], data['latency'], data['timing_rx'])
             metrics['windows'] = trends
             metrics['issues'], metrics['limits'] = diagnose(metrics, trends, cfg.get('analysis_limits'))
-            np.savez_compressed(out/f'{name}_recon.npz', **reconstructed)
-            plot_diagnostics(out, name, s, cfg, tx, rx, data, reconstructed, metrics, trends)
-            with (out/f'{name}_janelas.csv').open('w', newline='') as f:
+            np.savez_compressed(recorded/f'{name}_recon.npz', **reconstructed)
+            plot_diagnostics(figures, name, s, cfg, tx, rx, data, reconstructed, metrics, trends)
+            with (recorded/f'{name}_janelas.csv').open('w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=list(trends[0]))
                 writer.writeheader()
                 writer.writerows(trends)
@@ -345,7 +349,7 @@ def analyze(directory, tx_directory=None):
             ax.set_xlabel('ID do marcador sync')
             ax.grid(alpha=.25)
             ax.legend()
-        fig.savefig(out/'sync.png', dpi=130)
+        fig.savefig(figures/'sync.png', dpi=130)
         plt.close(fig)
     report['notes'] = [
         'Latency ends at Python pull_chunk completion; it includes polling, batching and scheduling.',
@@ -358,32 +362,34 @@ def analyze(directory, tx_directory=None):
         'Delivery reconstruction holds the latest available sample per read; within-chunk arrival times are not observable.',
         'Issue thresholds are illustrative configurable limits, not sensor requirements or physical certification.'
     ]
-    (out/'report.json').write_text(json.dumps(report, indent=2, allow_nan=False))
-    with (out/'summary.csv').open('w', newline='') as f:
+    (recorded/'report.json').write_text(json.dumps(report, indent=2, allow_nan=False))
+    with (out/'sumario.csv').open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    lines = ['# Diagnóstico temporal', '',
+    lines = ['# Sumário da transmissão', '',
              'Reconstrução em uma origem comum, sem remover atraso ou alinhar inícios individualmente.', '',
-             '| Sensor | Perdas | RMSE por índice | RMSE temporal na leitura | Atraso p99 (ms) | Drift acumulado (ms) |',
-             '| --- | --- | --- | --- | --- | --- |']
+             '| Sensor | Recebidas/previstas | Perdas | RMSE por índice | RMSE temporal na leitura | Atraso p99 (ms) | Drift (ppm) | Drift acumulado (ms) |',
+             '| --- | --- | --- | --- | --- | --- | --- | --- |']
     def number(value):
         return f'{value:.4g}' if value is not None else 'indisponível'
     for row in rows:
-        lines.append(f'| {row["sensor"]} | {row["missing"]} | {number(row["rmse"])} | '
-                     f'{number(row["temporal_delivery_rmse"])} | {number(row["p99_ms"])} | {number(row["accumulated_ms"])} |')
+        lines.append(f'| {row["sensor"]} | {row["received"]}/{row["expected"]} | {row["missing"]} | {number(row["rmse"])} | '
+                     f'{number(row["temporal_delivery_rmse"])} | {number(row["p99_ms"])} | {number(row["drift_ppm"])} | {number(row["accumulated_ms"])} |')
     for name, metrics in report['sensors'].items():
-        lines += ['', f'**{name}** — [{name}_tempo.png]({name}_tempo.png)']
+        lines += ['', f'**{name}** — [Ver figura](figuras/{name}.png)']
         lines += ['- '+issue['message'] for issue in metrics['issues']] or ['- Nenhum limite configurado excedido.']
+    if (figures/'sync.png').exists():
+        lines += ['', '[Alinhamento dos marcadores](figuras/sync.png)']
     lines += ['', f'Marcadores: {report["markers"]["received"]}/{report["markers"]["expected"]} recebidos; '
               f'{report["markers"]["missing"]} perdidos; {report["markers"]["duplicates"]} duplicados.',
               f'Conclusão: transmissor={txmeta["complete"]}, receptor={rxmeta["complete"]}.']
-    lines += ['', 'Os limites estão em `report.json` e podem ser alterados com `analysis_limits` no JSON do experimento.',
+    lines += ['', 'Os detalhes e limites estão em `dados/report.json` e podem ser alterados com `analysis_limits` em configuracao.py.',
               'RMSE temporal usa valores no mesmo instante; RMSE por índice mede apenas preservação de amplitude.',
               'Leitura é o fim de pull_chunk no Python, não chegada física ao sensor ou à interface de rede.',
               'Drift acumulado é diferença temporal desde a primeira amostra pareada, não soma dos atrasos.',
               'Latência crescente pode indicar filas; não é, por si só, drift de relógio.']
-    (out/'diagnostico.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
+    (out/'sumario.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
     return report
 
 
