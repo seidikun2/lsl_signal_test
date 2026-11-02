@@ -11,3 +11,6 @@ reuns/
 tests/
 results/**/*.npz
 results/*.npz
+results/*.zip
+recordings.zip
+recordings.npz

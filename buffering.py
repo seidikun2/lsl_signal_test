@@ -577,6 +577,7 @@ def plots(rows, traces, groups):
     plt.rcParams.update({'font.size': 10})
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     load_groups = [g for g in groups if g['axis']=='load']
+    base_rate=next((r['rate_hz'] for r in rows if r['axis']=='load'),512)
     for ax, field, label in zip(axes.flat, ['queue_slope_ms_s', 'total_p99_ms', 'queue_peak_ms', 'drain_s'],
                                ['Queue growth (ms per second)', 'Total delay p99 (ms)',
                                 'Peak queue, expressed as signal time (ms)', 'Time to process the remaining data (s)']):
@@ -584,13 +585,13 @@ def plots(rows, traces, groups):
             mean, lo, hi = g[field]
             if mean is None:
                 continue
-            ax.plot(g['value'], mean, 'o', color='#245cb0')
+            ax.plot(1000*g['value']/base_rate, mean, 'o', color='#245cb0')
             if lo is not None:
-                ax.vlines(g['value'], lo, hi, color='#245cb0', linewidth=2)
+                ax.vlines(1000*g['value']/base_rate, lo, hi, color='#245cb0', linewidth=2)
         valid = [g for g in load_groups if g[field][0] is not None]
-        ax.plot([g['value'] for g in valid], [g[field][0] for g in valid], color='#245cb0', alpha=.5)
-        ax.axvline(1, color='#a33', ls='--', label='nominal cost = available time')
-        ax.set(xlabel='Nominal load: processing cost / interarrival time', ylabel=label)
+        ax.plot([1000*g['value']/base_rate for g in valid], [g[field][0] for g in valid], color='#245cb0', alpha=.5)
+        ax.axvline(1000/base_rate, color='#a33', ls='--', label='time available for one sample')
+        ax.set(xlabel='Added processing time per sample (ms)', ylabel=label)
         ax.grid(alpha=.2)
     fig.suptitle('When does the receiver fall behind? Mean and 95% run-level bootstrap CI')
     axes[0, 0].legend(fontsize=8, loc='upper left')
@@ -605,7 +606,7 @@ def plots(rows, traces, groups):
         r = selected[len(selected)//2]
         t = traces[r['case']]
         x = t['batches'][:, 1]-float(t['start'])-float(t['correction'])
-        label = f'load {load:g} ({r["case"]})'
+        label = f'{1000*load/base_rate:.2f} ms per sample ({r["case"]})'
         axes[0].plot(x, t['batches'][:, 3]/r['rate_hz'], label=label)
         axes[1].plot(t['delay_windows'][:, 0], t['delay_windows'][:, 1], label=label)
         times = t['processed']-float(t['start'])-float(t['correction'])
@@ -624,7 +625,7 @@ def plots(rows, traces, groups):
     if available:
         handles, labels = axes[2].get_legend_handles_labels()
         axes[2].legend(handles[-1:], labels[-1:], fontsize=9)
-    axes[2].set(xlabel='Wall time since acquisition start (s)')
+    axes[2].set(xlabel='Time since acquisition start (s)')
     fig.suptitle('Measured timeline: one representative run per load (selected by median p99)')
     fig.tight_layout()
     timeline = figure_data(fig)
@@ -675,7 +676,7 @@ def saturation_plot(rows, traces):
                 axes[1].plot(t['processed'][-1]-origin,row['lost'],'o',color=color)
     axes[0].axhline(100, color='#a33', ls='--', label='configured capacity')
     axes[0].set(ylabel='Queue / configured capacity (%)')
-    axes[1].set(ylabel='Missing samples identified by sequence index',xlabel='Wall time since acquisition start (s)')
+    axes[1].set(ylabel='Missing samples identified by sequence index',xlabel='Time since acquisition start (s)')
     if candidates:
         for ax in axes:
             ax.axvline(candidates[0]['duration_s'],color='#a33',ls=':',label='end of transmission' if ax is axes[0] else None)
@@ -752,7 +753,7 @@ def sampling_sections(rows, traces, groups, cfg):
         plt.close(fig)
         sections.append(f'<section><h2>{title}</h2><p>Imposed processing cost per sample: '
                         f'{cfg.get("rate_processing_s_per_sample",0)*1e6:g} µs. Zero removes the artificial wait, but reading, '
-                        'conversion, generation and transport still consume wall time. In simultaneous-stream curves, '
+                        'conversion, generation and transport still consume time measured by the computer. In simultaneous-stream curves, '
                         'only the EEG rate changes; EMG and IMU retain their rates and channels. Streams are not pooled as independent repetitions. '
                         'For incomplete runs, p99 covers processed samples only; unknown total loss is never replaced with zero.</p>'
                         f'<img src="{image}" alt="Rate sweep and effect on each stream"></section>')
@@ -804,13 +805,13 @@ def sampling_sections(rows, traces, groups, cfg):
     return ''.join(sections)
 
 
-def local_sections(rows, traces, groups, cfg):
+def local_sections(rows, traces, groups, cfg,include_streams=True,include_recovery=True):
     """Show each stream separately; never pool correlated streams as repetitions."""
     import matplotlib.pyplot as plt
     sections = []
     valid = [r for r in rows if not r.get('error')]
     incremental = [r for r in valid if r['axis']=='streams']
-    if incremental:
+    if incremental and include_streams:
         fig,axes = plt.subplots(2,2,figsize=(13,8))
         names = [s['name'] for s in cfg['stream_sensors']]
         last_stage = max(r['value'] for r in incremental)
@@ -841,7 +842,7 @@ def local_sections(rows, traces, groups, cfg):
         axes[0,1].set_ylabel('Waiting queue (milliseconds of signal)')
         axes[1,1].set_ylabel('Total delay per window (ms)')
         for ax in axes[:,1]:
-            ax.set_xlabel(f'Wall time (s), run {central}')
+            ax.set_xlabel(f'Time (s), run {central}')
             ax.axvline(cfg['duration_s'],ls=':',color='#a33')
         for ax in axes.flat:
             ax.grid(alpha=.2)
@@ -858,7 +859,7 @@ def local_sections(rows, traces, groups, cfg):
                         'Time plots use streams from the same representative run, without combining different runs.</p>'
                         f'<img src="{image}" alt="Effect of adding EEG, EMG and IMU on latency and queues"></section>')
     recovery = [r for r in valid if r['axis']=='recovery']
-    if recovery:
+    if recovery and include_recovery:
         selected = sorted(recovery,key=lambda r: r['recovery_s'] if r['recovery_s'] is not None else float('inf'))
         row = selected[len(selected)//2]
         t = traces[row['case']]
@@ -882,7 +883,7 @@ def local_sections(rows, traces, groups, cfg):
             ax.grid(alpha=.2)
         axes[0].set_ylabel('Queue (milliseconds of signal)')
         axes[1].set_ylabel('Total delay (ms)')
-        axes[2].set(ylabel='Processed fraction',xlabel='Wall time since start (s)')
+        axes[2].set(ylabel='Processed fraction',xlabel='Time since start (s)')
         axes[0].legend(ncol=2,fontsize=8)
         axes[2].legend(fontsize=8,ncol=2)
         fig.suptitle(f'Recovery during continuous transmission — representative run {row["case"]}')
@@ -916,7 +917,8 @@ def report(root, rows, traces, cfg):
     images = plots(rows, traces, groups)
     saturation = saturation_plot(rows,traces) if any(not r.get('error') and
                   (r['axis']=='buffer' or (r['axis']=='load' and r['value']==3)) for r in rows) else None
-    extras = local_sections(rows,traces,groups,cfg)+sampling_sections(rows,traces,groups,cfg)
+    extras = sampling_sections(rows,traces,groups,cfg)+local_sections(rows,traces,groups,cfg,include_recovery=False)
+    recovery_last=local_sections(rows,traces,groups,cfg,include_streams=False)
     valid = [r for r in rows if not r.get('error')]
     load = [g for g in groups if g['axis']=='load' and g['n']]
     rising = [g['value'] for g in load if g['queue_slope_ms_s'][1] is not None and
@@ -987,7 +989,11 @@ img{{max-width:100%;height:auto}}.cards{{display:flex;gap:16px;flex-wrap:wrap}}.
 strong.big{{font-size:28px;display:block}}table{{border-collapse:collapse;width:100%;font-size:13px}}
 td,th{{padding:9px;border-bottom:1px solid #dce3ef;text-align:left}}th{{background:#e8eef8;position:sticky;top:0}}
 .scroll{{overflow:auto}}p,li{{line-height:1.6}}code{{background:#e8eef8;padding:2px 5px}}</style>
-<h1>LSL: does the receiver keep up or let the queue grow?</h1>
+<h1>Extra tests — deliberately slow processing</h1>
+<p>Normal EEG and additional-signal tests are run separately with <code>python main.py</code>.
+Here, processing time is added on purpose. A processing-time ratio of 1 uses all time available between samples;
+2 means processing takes twice as long. For example, 1000 samples/s allow 1 ms per sample: 2 ms of processing gives ratio 2.
+Recovery is shown at the end and means the queue empties after the added wait is removed.</p>
 <p>Controlled per-sample cost; real transmission between LSL processes. Acquisition duration: {durations} s, depending on the scenario.
 Randomized order, seed {cfg['seed']}. {attempted} runs attempted; {len(rows)} stream measurements; {failures} technical failures.</p>
 <p>Acquisition machine: {machine}. Python and operating system are recorded during acquisition; reanalysis on another machine does not change them.</p>
@@ -1014,7 +1020,7 @@ they must not be added to obtain p99. If observation ends with pending data,
 p99 and maximum cover processed samples only; they do not summarize the unprocessed tail.</p><div class="scroll"><table><tr><th>Load</th><th>n</th><th>TX chunk/scheduling ms</th>
 <th>Transport/queue ms</th><th>Batch processing ms</th><th>Total p99 ms</th></tr>{''.join(components)}</table></div>
 <p>Added delay is the difference between the last and first valid production windows, not the sum of all sample delays.
-Queue ms/s measures how much additional signal time accumulates per wall-clock second. Drain time runs from the end of acquisition to the last processing completion;
+Queue ms/s measures how much additional signal time accumulates per second measured by the computer. Drain time runs from the end of acquisition to the last processing completion;
 when incomplete, it is only the observed time, not the time needed to recover.</p></section>
 <section><h2>Nyquist and streams with different rates</h2><p>Acquisition rate must exceed twice the highest signal frequency,
 with antialias filtering and a practical margin. This differs from the batch-reading frequency and display grid rate.
@@ -1038,7 +1044,7 @@ Latency uses the initial LSL clock correction and ends in the Python process, no
 Technical failures are never included in averages as zero.</p></section>
 <section><h2>6. All runs</h2><p>Files: <code>metrics.csv</code> (measurements), <code>timeline.csv</code> (queue per read),
 <code>recordings.npz</code> (traces for reanalysis). This HTML embeds all plots, without separate figure folders.</p>
-<div class="scroll"><table><tr>{''.join('<th>'+h+'</th>' for h in headers)}</tr>{''.join(table)}</table></div></section></html>'''
+<div class="scroll"><table><tr>{''.join('<th>'+h+'</th>' for h in headers)}</tr>{''.join(table)}</table></div></section>{recovery_last}</html>'''
     (root/'summary.html').write_text(text, encoding='utf-8')
     return groups, primary, boundary
 

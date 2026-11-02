@@ -41,13 +41,14 @@ def transmit(cfg, run_id, directory):
     save_json(out / 'config.json', cfg)
     outlets, states = {}, {}
     for s in cfg['sensors']:
-        info = StreamInfo(f'{run_id}_{s["name"]}', s['kind'], s['channels']+1,
+        info = StreamInfo(f'{run_id}_{s["name"]}', s['kind'], s['channels']+2,
                           s['rate'], cf_double64, f'{run_id}:{s["name"]}')
         info.desc().append_child_value('validation_index_channel', str(s['channels']))
+        info.desc().append_child_value('sender_time_channel', str(s['channels']+1))
         info.desc().append_child_value('signal_channels', str(s['channels']))
         info.desc().append_child_value('synthetic', 'true')
         outlets[s['name']] = StreamOutlet(info, chunk_size=0, max_buffered=cfg['inlet_buffer'])
-        states[s['name']] = dict(next=0, ids=[], values=[], sample=[], generated=[], sent=[])
+        states[s['name']] = dict(next=0, ids=[], values=[], sample=[], generated=[], sent=[],sender_time_s=[],sender_send_time_s=[])
     markers = StreamOutlet(StreamInfo(f'{run_id}_markers', 'Markers', 1, 0,
                                       cf_string, f'{run_id}:markers'))
     # No samples are sent until every inlet has connected.
@@ -81,7 +82,7 @@ def transmit(cfg, run_id, directory):
             time.sleep(remaining)
         if s is None:
             sent = local_clock()
-            payload = dict(events[event_index], sample_time=when, sent=sent)
+            payload = dict(events[event_index], sample_time=when, sent=sent,sender_time_s=events[event_index]['nominal'])
             markers.push_sample([json.dumps(payload)], timestamp=when, pushthrough=True)
             marker_log.append(payload)
             event_index += 1
@@ -90,19 +91,24 @@ def transmit(cfg, run_id, directory):
         ids = np.arange(st['next'], end, dtype=np.int64)
         generated = local_clock()
         elapsed = sample_elapsed(ids/s['rate'], s)
-        values = signal(s['kind'], ids, s['rate'], s['channels'], stimuli, elapsed)
+        values = signal(s['kind'], ids, s['rate'], s['channels'], stimuli if s['kind'].upper()=='EEG' else [], elapsed)
         ts = start + elapsed
-        packet = np.column_stack((values, ids))
+        packet = np.column_stack((values, ids, elapsed))
         sent = local_clock()
         outlets[s['name']].push_chunk(packet.tolist(), ts.tolist(), pushthrough=True)
         for key, value in [('ids', ids), ('values', values), ('sample', ts),
-                           ('generated', np.full(len(ids), generated)), ('sent', np.full(len(ids), sent))]:
+                           ('generated', np.full(len(ids), generated)), ('sent', np.full(len(ids), sent)),
+                           ('sender_time_s',elapsed),('sender_send_time_s',np.full(len(ids),sent-start))]:
             st[key].append(value)
         st['next'] = end
     for name, st in states.items():
         np.savez_compressed(out / f'tx_{name}.npz', **{
-            key: np.concatenate(st[key]) for key in ('ids', 'values', 'sample', 'generated', 'sent')})
+            key: np.concatenate(st[key]) for key in ('ids', 'values', 'sample', 'generated', 'sent','sender_time_s','sender_send_time_s')})
     save_json(out / 'tx_markers.json', marker_log)
     save_json(out / 'tx_meta.json', dict(run_id=run_id, start=start, complete=True))
-    # Keep outlets alive while receivers drain, including under deliberate pauses.
-    time.sleep(max(2., cfg['receiver_pause'] + 1.))
+    # Keep outlets until the receiver has drained and closed its inlets.
+    deadline=time.monotonic()+max(30.,cfg['receiver_pause']+3)
+    while not (out/'rx_meta.json').exists():
+        if time.monotonic()>deadline:
+            raise TimeoutError('Receiver did not finish draining within the time limit')
+        time.sleep(.02)
