@@ -50,7 +50,7 @@
     "duration_s": 5,
     "samples_per_stream": 1024,
     "eeg": {
-      "rates": [500, 750, 1000, 1500, 2048],
+      "rates": [500, 512, 731.5, 1000, 1500, 2048],
       "channels": [16, 32, 64, 128],
       "chunks": [1],
       "buffers_s": [60],
@@ -71,9 +71,9 @@
     "receiver_pause": 0,
     "pause_every": 2,
     "sensors": [
-      {"name": "eeg", "kind": "EEG", "rate": 500, "channels": 32},
+      {"name": "eeg", "kind": "EEG", "rate": 512, "channels": 32},
       {"name": "emg", "kind": "EMG", "rate": 2000, "channels": 8},
-      {"name": "imu", "kind": "IMU", "rate": 100, "channels": 9}
+      {"name": "imu", "kind": "IMU", "rate": 70, "channels": 9}
     ],
     "markers": [
       {"label": "A", "interval": 2.0, "first": 0.3, "delay": 0.2, "width": 0.08, "amplitude": 1.0},
@@ -90,5 +90,15 @@
     },
     "plot_channels": [0, 1],
     "snapshot_seconds": 2
+  },
+  "real_eeg": {
+    "stream_name": "EE225-020034-000905_on_DESKTOP-U197OKE",
+    "marker_name": "",
+    "duration_s": 60,
+    "buffer_s": 60,
+    "read_chunk": 256,
+    "receiver_poll_hz": 2048,
+    "resolve_timeout_s": 10,
+    "clock_update_s": 2
   }
 }

@@ -309,7 +309,39 @@ def main():
     parser.add_argument('--signals',action='store_true',help='Run normal signal and marker tests')
     parser.add_argument('--local',action='store_true',help='Run separate extra tests with deliberately slow processing')
     parser.add_argument('--reanalyze',help='Rebuild results from recordings.zip or the older buffering recordings.npz')
+    parser.add_argument('--real-eeg',action='store_true',help='Record the existing device outlet, without generating signals')
+    parser.add_argument('--list-streams',action='store_true',help='List live LSL stream names, rates and channel counts')
+    parser.add_argument('--compare-eeg',metavar='RECORDING',help='Compare a real recordings.npz with a simultaneous reference')
+    parser.add_argument('--reference',help='Simultaneous LabRecorder XDF with original LSL timestamps')
+    parser.add_argument('--eeg-name',help='Override the real EEG stream name')
+    parser.add_argument('--marker-name',help='Select an optional real marker stream by exact name')
+    parser.add_argument('--duration',type=float,help='Real EEG capture duration in seconds')
     args=parser.parse_args()
+    real_modes=sum(bool(v) for v in (args.real_eeg,args.list_streams,args.compare_eeg))
+    if real_modes:
+        if real_modes>1 or args.local or args.signals or args.reanalyze:
+            parser.error('Select one acquisition or comparison mode at a time')
+        if not args.real_eeg and (args.eeg_name or args.marker_name or args.duration is not None):
+            parser.error('Name and duration overrides require --real-eeg')
+        import real_eeg
+        if args.list_streams:
+            if args.reference or args.plan_only:parser.error('--list-streams cannot be combined with --reference or --plan-only')
+            real_eeg.list_streams()
+        elif args.compare_eeg:
+            if not args.reference or args.plan_only:parser.error('--compare-eeg requires --reference and cannot use --plan-only')
+            real_eeg.compare(args.compare_eeg,args.reference,args.out)
+        else:
+            if args.reference:parser.error('Stop the reference recorder first, then use --compare-eeg with --reference')
+            document=json.loads(Path(args.config).read_text())
+            cfg=document['real_eeg']
+            for key,value in [('stream_name',args.eeg_name),('marker_name',args.marker_name),('duration_s',args.duration)]:
+                if value is not None:cfg[key]=value
+            cfg=real_eeg.settings({'real_eeg':cfg})
+            if args.plan_only:print(json.dumps(cfg,indent=2))
+            else:real_eeg.capture(cfg,args.out or Path(__file__).with_name('results-real'))
+        return
+    if args.reference or args.eeg_name or args.marker_name or args.duration is not None:
+        parser.error('Reference/name/duration options require a real EEG mode')
     if args.local and (args.signals or args.reanalyze):parser.error('--local cannot be combined with --signals or --reanalyze')
     if args.reanalyze:
         if args.signals or args.plan_only:parser.error('--reanalyze cannot be combined with --signals or --plan-only')
