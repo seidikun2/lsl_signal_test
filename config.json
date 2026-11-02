@@ -13,8 +13,8 @@
     "primary_high_min": 1.0,
     "stream_processing_s_per_sample": 0.0004,
     "rate_repeats": 3,
-    "rates_hz": [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384],
-    "stream_eeg_rates_hz": [512, 2048, 8192, 16384],
+    "rates_hz": [500, 750, 1000, 1500, 2048],
+    "stream_eeg_rates_hz": [],
     "rate_processing_s_per_sample": 0,
     "recovery": {
       "baseline_s": 10,
@@ -37,7 +37,7 @@
     "buffer_s": 8,
     "loads": [0.25, 0.6, 0.9, 1.05, 1.5, 3.0],
     "buffers_s": [1, 2],
-    "rates_hz": [64, 256, 1024, 4096, 16384],
+    "rates_hz": [500, 750, 1000, 1500, 2048],
     "tx_chunks": [1, 128, 512],
     "rate_sweep_processing_s_per_sample": 0.0009765625,
     "max_drain_s": 8,
@@ -50,9 +50,9 @@
     "duration_s": 5,
     "samples_per_stream": 1024,
     "eeg": {
-      "rates": [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384],
+      "rates": [500, 750, 1000, 1500, 2048],
       "channels": [16, 32, 64, 128],
-      "chunks": [16],
+      "chunks": [1],
       "buffers_s": [60],
       "pauses_s": [0],
       "repeats": 3
@@ -62,15 +62,16 @@
     }
   },
   "acquisition": {
-    "reconstruction_rate_hz": 16384,
+    "reconstruction_rate_hz": 2048,
+    "receiver_poll_hz": 2048,
     "delivery_max_age_s": 0.25,
     "playback_delay_s": 0.25,
-    "chunk": 16,
+    "chunk": 1,
     "inlet_buffer": 60,
     "receiver_pause": 0,
     "pause_every": 2,
     "sensors": [
-      {"name": "eeg", "kind": "EEG", "rate": 512, "channels": 32},
+      {"name": "eeg", "kind": "EEG", "rate": 500, "channels": 32},
       {"name": "emg", "kind": "EMG", "rate": 2000, "channels": 8},
       {"name": "imu", "kind": "IMU", "rate": 100, "channels": 9}
     ],

@@ -51,9 +51,10 @@ def transmit(cfg, run_id, directory):
         states[s['name']] = dict(next=0, ids=[], values=[], sample=[], generated=[], sent=[],sender_time_s=[],sender_send_time_s=[])
     markers = StreamOutlet(StreamInfo(f'{run_id}_markers', 'Markers', 1, 0,
                                       cf_string, f'{run_id}:markers'))
-    # No samples are sent until every inlet has connected.
+    # No samples are sent until every inlet has connected and measured its clock.
     deadline = time.monotonic() + 45
-    while not (markers.have_consumers() and all(o.have_consumers() for o in outlets.values())):
+    while not (markers.have_consumers() and all(o.have_consumers() for o in outlets.values())
+               and (out/'rx_ready.json').exists()):
         if time.monotonic() > deadline:
             raise TimeoutError('Not all receivers connected within 45 s')
         time.sleep(.02)
@@ -91,7 +92,8 @@ def transmit(cfg, run_id, directory):
         ids = np.arange(st['next'], end, dtype=np.int64)
         generated = local_clock()
         elapsed = sample_elapsed(ids/s['rate'], s)
-        values = signal(s['kind'], ids, s['rate'], s['channels'], stimuli if s['kind'].upper()=='EEG' else [], elapsed)
+        values = signal(s['kind'], ids, s['rate'], s['channels'],
+                        stimuli if s['kind'].upper()=='EEG' or cfg.get('shared_sensor_events') else [], elapsed)
         ts = start + elapsed
         packet = np.column_stack((values, ids, elapsed))
         sent = local_clock()

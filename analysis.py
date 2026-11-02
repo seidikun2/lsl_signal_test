@@ -249,6 +249,10 @@ def compare(tx, rx, rate):
         metrics['counter_delay_ms']=distribution((rx['receiver_time_s'][ir]-rx['sender_time_s'][ir])*1000)
         if 'sender_send_time_s' in tx:
             metrics['counter_after_send_ms']=distribution((rx['receiver_time_s'][ir]-tx['sender_send_time_s'][it])*1000)
+    attempts=rx.get('read_attempt_time_s',np.empty(0))
+    if len(attempts)>1 and np.ptp(attempts)>0:
+        metrics['receiver_measured_hz']=float((len(attempts)-1)/np.ptp(attempts))
+        metrics['read_gap_ms']=distribution(np.diff(attempts)*1000)
     return metrics, dict(common=common, it=it, ir=ir, elapsed=elapsed,
                          latency=latency, queue=queue, timing_tx=timing_tx,
                          timing_rx=timing_rx, timestamp_error=timestamp_error,
@@ -275,6 +279,9 @@ def case_result(name, cfg, sensor, metrics=None, error=''):
         status='failed' if error else 'completed', stream_count=len(cfg['sensors']),
         rate_hz=sensor['rate'], channels=sensor['channels'], chunk=cfg['chunk'], buffer_s=cfg['inlet_buffer'],
         pause_s=cfg['receiver_pause'], duration_s=sample_count(cfg,sensor)/sensor['rate'],
+        receiver_target_hz=cfg.get('receiver_poll_hz'), receiver_measured_hz=m.get('receiver_measured_hz'),
+        read_gap_p99_ms=m.get('read_gap_ms',{}).get('p99'),
+        read_gap_max_ms=m.get('read_gap_ms',{}).get('max'),
         injected_drift_ppm=sensor.get('drift_ppm',cfg['drift_ppm']),
         injected_slope_ppm_s=sensor.get('drift_slope_ppm_s',0),
         received=m.get('received'), expected=m.get('expected'), missing=m.get('missing'),
@@ -302,6 +309,18 @@ def recorded_time_vectors(tx,rx,origin,offset):
     return sent,carried,received
 
 
+def live_view(tx,rx,origin,offset,rate,seconds,channel):
+    """Compare both latest-value views on one fixed clock; preserve real delay."""
+    sent,_,received=recorded_time_vectors(tx,rx,origin,offset)
+    grid=np.arange(int(np.floor(seconds*rate))+1)/rate
+    source=delivery_hold(sent,tx['values'][:,[channel]],grid,tx['ids'])[:,0]
+    available=delivery_hold(received,rx['values'][:,[channel]],grid,rx['ids'])[:,0]
+    return grid,source,available
+
+
+MARKER_COLORS=('#c45a00','#7951b0','#008578','#b82f65','#2474b5')
+
+
 def plot_snapshot(out,case,sensor,cfg,tx,rx,markers_tx,markers_rx,origin,offset,response_events=()):
     """Show sample values, actual read availability, and the measured delay."""
     import matplotlib.pyplot as plt
@@ -317,15 +336,11 @@ def plot_snapshot(out,case,sensor,cfg,tx,rx,markers_tx,markers_rx,origin,offset,
     axes[0].plot(sent[source],tx['values'][source,channel],label='Sent signal',lw=1.2)
     axes[0].plot(carried[recorded],values[recorded],'--',label='Received signal',lw=1)
     axes[0].set(title='Signal values — sample time carried by the sender',ylabel='Value',xlim=(0,window))
-    axes[1].plot(sent[source],tx['values'][source,channel],label='Sent signal',lw=1.1)
-    if len(received):
-        ends=np.r_[np.flatnonzero(np.diff(received)>0)+1,len(received)]
-        starts=np.r_[0,ends[:-1]]
-        selected=np.array([a+np.argmax(rx['ids'][a:b]) for a,b in zip(starts,ends)])
-        selected=selected[rx['ids'][selected]==np.maximum.accumulate(rx['ids'][selected])]
-        selected=selected[(received[selected]>=0)&(received[selected]<=window)]
-        axes[1].step(received[selected],rx['values'][selected,channel],where='post',label='Received signal',lw=1,color='tab:green')
-    axes[1].set(title='When the values were available — receiver time',ylabel='Value',xlim=(0,window))
+    display_rate=cfg.get('reconstruction_rate_hz',2048)
+    grid,source_live,received_live=live_view(tx,rx,origin,offset,display_rate,window,channel)
+    axes[1].step(grid,source_live,where='post',label='Sent signal',lw=1.2)
+    axes[1].step(grid,received_live,where='post',label='Received signal',lw=1.2,ls='--',color='tab:green')
+    axes[1].set(title=f'Live view at {display_rate:g} Hz — latest available value, not the full reconstruction',ylabel='Value',xlim=(0,window))
     axes[2].plot(carried,(received-carried)*1000,lw=.8,label='Since sample time')
     common,it,ir=np.intersect1d(tx['ids'],rx['ids'],return_indices=True)
     if len(common):
@@ -336,32 +351,34 @@ def plot_snapshot(out,case,sensor,cfg,tx,rx,markers_tx,markers_rx,origin,offset,
     for ax in axes[:2]:
         ax.legend(loc='upper right',fontsize=8)
     if eeg:
+        from matplotlib.lines import Line2D
         labels=list(dict.fromkeys(e['label'] for e in response_events))
-        seen=set()
+        colors={label:MARKER_COLORS[i%len(MARKER_COLORS)] for i,label in enumerate(labels)}
         for event in response_events:
             y=labels.index(event['label'])
-            for label,first,last,color,dy in [
-                ('Sent',event.get('marker_sent_s'),event.get('eeg_changed_sent_s'),'tab:blue',.15),
-                ('Received',event.get('marker_received_s'),event.get('eeg_changed_received_s'),'tab:green',-.15)]:
+            color=colors[event['label']]
+            for label,first,last,dy,style,fill in [
+                ('Sent',event.get('marker_sent_s'),event.get('signal_changed_sent_s'),.20,'-',color),
+                ('Received',event.get('marker_received_s'),event.get('signal_changed_received_s'),-.20,'--','white')]:
                 if first is not None and first<=window:
-                    key=label+' marker'
-                    axes[3].plot(first,y+dy,'|',ms=12,color=color,label=key if key not in seen else None);seen.add(key)
+                    axes[3].plot(first,y+dy,marker='o',ms=9,color=color,mfc=fill,mew=2)
                 if last is not None and last<=window:
-                    key=label+' EEG change'
-                    axes[3].plot(last,y+dy,'^',ms=5,color=color,label=key if key not in seen else None);seen.add(key)
+                    axes[3].plot(last,y+dy,marker='^',ms=9,color=color,mfc=fill,mew=2)
                 if first is not None and last is not None and first<=window:
-                    axes[3].plot([first,last],[y+dy,y+dy],color=color,lw=.8)
-        axes[3].set_yticks(range(len(labels)),labels)
+                    axes[3].plot([first,last],[y+dy,y+dy],color=color,lw=2.8,ls=style)
+                if first is not None and 0<=first<=window:
+                    axes[0 if label=='Sent' else 1].axvline(first,color=color,ls=style,lw=2.2,alpha=.8)
+        axes[3].set_yticks([i+d for i in range(len(labels)) for d in (.20,-.20)],
+                           [f'{label} — {kind}' for label in labels for kind in ('sent','received')])
+        axes[3].set_ylim(-.55,max(.55,len(labels)-.45))
         axes[3].set(title='Markers and the EEG change they caused',xlabel='Time from shared start (s)',xlim=(0,window),ylabel='Marker')
-        if seen:axes[3].legend(fontsize=8,ncol=2,loc='upper right')
-        # Mark the actual detected source change, not a response inferred from its schedule.
-        for event in response_events:
-            for key,style in [('marker_sent_s',':'),('eeg_changed_sent_s','--')]:
-                t=event.get(key)
-                if t is not None and 0<=t<=window:axes[0].axvline(t,color='.55',ls=style,lw=.6)
+        axes[3].legend(handles=[Line2D([],[],color='.25',lw=2.8,ls=style,marker=marker,ms=7,mfc=fill,label=label)
+            for label,style,marker,fill in [('Sent marker','-','o','.25'),('Received marker','--','o','white'),
+                ('Sent EEG change','-','^','.25'),('Received EEG change','--','^','white')]],fontsize=8,ncol=2,loc='upper left')
     for ax in axes:ax.grid(alpha=.18)
-    fig.suptitle(f'{case} / {sensor["name"].upper()} — {sensor["rate"]:g} Hz, {sensor["channels"]} channels\n'
-                 'Top: all sample values. Second: latest value at each read; a batch shares one read time. No curve shifting.',fontsize=11)
+    caption='Top: all sample values. Second: fixed display clock. '
+    caption+=('Marker color identifies A, B or C; solid = sent, dashed = received.' if eeg else 'All samples remain saved; no curve shifting.')
+    fig.suptitle(f'{case} / {sensor["name"].upper()} — {sensor["rate"]:g} Hz, {sensor["channels"]} channels\n'+caption,fontsize=10)
     fig.savefig(Path(out)/f'{case}_{sensor["name"]}_snapshot.png',dpi=115)
     plt.close(fig)
 
@@ -471,8 +488,8 @@ def _result_maps(out,rows,x_values,y_values,x_key,y_key,x_labels,y_labels,title,
     from matplotlib.patches import Rectangle
     fig,axes=plt.subplots(2,3,figsize=(18,9),constrained_layout=True)
     fields=[('after_send_p99_ms','Delay after send p99 (ms)'),('latency_p99_ms','Sample-to-read delay p99 (ms)'),('missing_pct','Missing samples (%)'),
-            ('sample_rmse','Difference in signal values'),('marker_sample_error_ms','EEG / marker\nstored-time difference (ms)'),
-            ('response_error_ms','EEG / marker\narrival-time difference (ms)')]
+            ('sample_rmse','Difference in signal values'),('marker_sample_error_ms','Signal / marker\nstored-time difference (ms)'),
+            ('response_error_ms','Signal / marker\narrival-time difference (ms)')]
     for ax,(key,label) in zip(axes.flat,fields):
         matrix,failed=result_matrix(rows,key,x_values,y_values,x_key,y_key)
         finite=matrix[np.isfinite(matrix)]
@@ -539,6 +556,9 @@ def write_results_report(root,plan,rows,events,assets,maps,machine):
         f'<p>{counts["completed"]} completed · {counts["failed"]} failed · {counts["planned"]+counts["running"]} not finished. {read_note}</p>']
     if machine.get('label'):parts.append('<p><b>'+esc(machine['label'])+'</b></p>')
     if machine:parts.append('<p>Recorded on '+esc(machine.get('system',''))+' / Python '+esc(machine.get('python',''))+'.</p>')
+    targets=sorted({p['receiver_poll_hz'] for p in plan if p.get('receiver_poll_hz')})
+    if targets:
+        parts.append('<p>Receiver reading target: '+', '.join(f'{v:g} Hz' for v in targets)+'. Every cycle reads buffered samples from every stream. The operating system can delay a cycle; actual reading rates and gaps are listed below. Reading faster does not change sensor sampling rates.</p>')
     for experiment,number,title in [('eeg',1,'Test 1 — EEG only'),('streams',2,'Test 2 — adding signals')]:
         selected=[r for r in rows if r['experiment']==experiment]
         scheduled=[p for p in plan if p['test']==number]
@@ -556,20 +576,30 @@ def write_results_report(root,plan,rows,events,assets,maps,machine):
             options=''.join('<option value="'+esc(r['case']+'_'+r['stream'])+'">'+esc(f'{r["case"]} / {r["stream"].upper()} — {r["rate_hz"]:g} Hz, {r["channels"]} channels')+'</option>' for r in choices)
             parts.append(f'<label>Recorded case <select data-gallery="signal-{number}">{options}</select></label><img id="signal-{number}" alt="Sent and received signal, time counters, delay and EEG markers">')
         else:parts.append('<p>No signal recording is available yet.</p>')
-        parts.append('<p>The first plot compares all recorded sample values using the sender counter carried with the signal. The second uses the receiver\'s own read times and shows the latest value at each read. Samples in one batch share a read time; no individual arrival times are invented. The delay plot is receiver time minus the carried sender time. One fixed LSL clock offset sets a shared zero; curves are never shifted to fit.</p>')
+        parts.append('<p>The first plot uses every recorded sample and its carried sender time. The second is a live view on one fixed display clock: both curves keep the latest value available at each display step. It is not the full reconstruction. Empty reads retain the previous value; all samples remain saved. The delay plot uses actual read times. Curves are never shifted to fit. A faster reading loop cannot replace a higher acquisition rate.</p>')
         measured_events=[e for e in events if e['test']==number and e['stream'].lower()=='eeg']
         parts.append('<h3>EEG markers and the change in the signal</h3>')
-        parts.append('<p>A, B and C cause the configured change in the sent EEG, normally 200 ms later. The change is detected again in the received EEG values. Sent times use the source sample counter; received times use the receiver read counter. Both are plotted together above.</p>')
+        parts.append('<p>A, B and C cause the configured change in the sent EEG, normally 200 ms later. One color identifies each marker. Solid lines and filled symbols mean sent; dashed lines and hollow symbols mean received. Circles are markers; triangles are EEG changes. Sent times use the source sample counter; received times use the receiver read counter.</p>')
         if measured_events:
             display=[]
             for e in measured_events:
                 r=dict(e)
                 r['result']={'detected':'Change found','outside_recording':'Change falls after recording ends','missing_response':'EEG change missing','missing_source_response':'Sent EEG change missing','onset_lost':'First changed sample missing','missing_marker':'Marker missing','overlap':'Overlapping changes'}.get(e['status'],e['status'])
                 display.append(r)
-            parts.append('<details><summary>Show the recorded marker and EEG-change times</summary>'+table(display,[('case','Case'),('label','Marker'),('marker_sent_s','Sent marker (s)'),('eeg_changed_sent_s','Sent EEG change (s)'),('marker_received_s','Received marker (s)'),('eeg_changed_received_s','Received EEG change (s)'),('acquisition_error_ms','Stored timing difference (ms)'),('delivery_error_ms','Arrival timing difference (ms)'),('result','Recorded result')])+'</details>')
+            parts.append('<details><summary>Show the recorded marker and EEG-change times</summary>'+table(display,[('case','Case'),('label','Marker'),('marker_sent_s','Sent marker (s)'),('signal_changed_sent_s','Sent EEG change (s)'),('marker_received_s','Received marker (s)'),('signal_changed_received_s','Received EEG change (s)'),('acquisition_error_ms','Stored timing difference (ms)'),('delivery_error_ms','Arrival timing difference (ms)'),('result','Recorded result')])+'</details>')
         else:parts.append('<p>No marker-response measurements are available for this section.</p>')
-        parts.append('<details><summary>Every recorded result</summary>'+table(selected,[('case','Case'),('stream','Signal'),('rate_hz','Rate (Hz)'),('channels','Channels'),('received','Samples received'),('missing','Samples missing'),('after_send_p99_ms','After send p99 (ms)'),('latency_p99_ms','Sample to read p99 (ms)'),('sample_rmse','Signal difference'),('counter_error_ms','Carried time difference (ms)'),('status','Run result'),('error','Error')])+'</details></section>')
-    parts+=['<section><h2>After viewing the results</h2><p>These are recorded measurements, not an automatic diagnosis. Sample loss, delivery delay and marker timing are separate results.</p>',
+        if number==2:
+            parts.append('<h3>Synchronization between sensors</h3>')
+            sync_cases=[p['case'] for p in scheduled if p['case']+'_sync' in assets]
+            if sync_cases:
+                parts.append('<p>The same known event changes every simulated sensor. The first chart compares sample times for analysis; the second compares actual read times. Different acquisition rates can place the first changed sample slightly apart. The table separates that original difference from any added timing difference.</p>')
+                options=''.join('<option value="'+esc(case+'_sync')+'">'+esc(case)+'</option>' for case in sync_cases)
+                parts.append('<label>Simultaneous recording <select data-gallery="stream-sync">'+options+'</select></label><img id="stream-sync" alt="Same observed event in all sensors, before and after transmission">')
+                timing=[e for e in events if e['test']==2 and e['stream']!=e.get('reference_stream')]
+                parts.append('<details><summary>Time differences relative to EEG — every common event</summary>'+table(timing,[('case','Case'),('stream','Signal'),('label','Event'),('source_offset_ms','Sent difference (ms)'),('stored_offset_ms','Received sample difference (ms)'),('stored_offset_error_ms','Added sample difference (ms)'),('read_offset_ms','Read-time difference (ms)'),('status','Event result')])+'</details>')
+            else:parts.append('<p>No simultaneous common-event recording is available yet.</p>')
+        parts.append('<details><summary>Every recorded result</summary>'+table(selected,[('case','Case'),('stream','Signal'),('rate_hz','Acquisition (Hz)'),('channels','Channels'),('receiver_target_hz','Reading target (Hz)'),('receiver_measured_hz','Measured reading (Hz)'),('read_gap_p99_ms','Reading gap p99 (ms)'),('read_gap_max_ms','Largest reading gap (ms)'),('received','Samples received'),('missing','Samples missing'),('after_send_p99_ms','After send p99 (ms)'),('latency_p99_ms','Sample to read p99 (ms)'),('sample_rmse','Signal difference'),('counter_error_ms','Carried time difference (ms)'),('status','Run result'),('error','Error')])+'</details></section>')
+    parts+=['<section><h2>After viewing the results</h2><p>These are recorded measurements, not an automatic diagnosis. Sample loss, delivery delay and marker timing are separate results. The simulated sensors share one sender clock; independent physical devices need their own clock synchronization measurements.</p>',
         '<details><summary>Extra tests — slow processing and recovery</summary><p>Run <code>python main.py --local --out results-extra</code> only as a separate experiment. These tests deliberately add processing time. Recovery means the waiting data return to the initial level after that extra wait is removed, while transmission continues. A processing-time ratio of 1 uses all available time; 2 takes twice as long. These extra tests are not part of the normal LSL check above.</p></details>',
         '<p>Files: <code>metrics.csv</code>, <code>markers.csv</code>, and <code>recordings.zip</code>. The archive contains the original signal arrays and the sender/receiver time vectors for reanalysis.</p></section>']
     failed=[p for p in plan if p['status']=='failed']
@@ -600,7 +630,7 @@ def analyze_responses(cfg, sensor, tx, rx, txmarkers, rxmarkers, figures, origin
                     tx_ms=None,rx_acquisition_ms=None,rx_delivery_ms=None,
                     acquisition_error_ms=None,delivery_error_ms=None,tx_sample_id=None,rx_sample_id=None,
                     marker_sent_s=float(event['sample_time']-origin),marker_received_s=None,
-                    eeg_changed_sent_s=None,eeg_changed_received_s=None)
+                    signal_changed_sent_s=None,signal_changed_received_s=None,signal_sample_received_s=None)
         marker=received.get(event['id'])
         if marker:record['marker_received_s']=float(marker['arrival']-origin-offset)
         if not len(tx['sample']) or onset>tx['sample'][-1]+1e-9:
@@ -619,10 +649,11 @@ def analyze_responses(cfg, sensor, tx, rx, txmarkers, rxmarkers, figures, origin
             t=ti[0]
             record['tx_ms']=float((tx['sample'][t]-event['sample_time'])*1000)
             record['tx_sample_id']=int(tx['ids'][t])
-            record['eeg_changed_sent_s']=float(tx['sample'][t]-origin)
+            record['signal_changed_sent_s']=float(tx['sample'][t]-origin)
         if len(ri):
             record['rx_sample_id']=int(rx['ids'][ri[0]])
-            record['eeg_changed_received_s']=float(rx['arrival'][ri[0]]-origin-offset)
+            record['signal_changed_received_s']=float(rx['arrival'][ri[0]]-origin-offset)
+            record['signal_sample_received_s']=float(rx['corrected'][ri[0]]-origin-offset)
         if not len(ti): record['status']='missing_source_response'
         elif not marker: record['status']='missing_marker'
         elif len(ri) and rx['ids'][ri[0]]!=tx['ids'][ti[0]]: record['status']='onset_lost'
@@ -633,7 +664,7 @@ def analyze_responses(cfg, sensor, tx, rx, txmarkers, rxmarkers, figures, origin
             record['rx_delivery_ms']=float((rx['arrival'][r]-marker['arrival'])*1000)
             record['acquisition_error_ms']=record['rx_acquisition_ms']-record['tx_ms']
             record['delivery_error_ms']=record['rx_delivery_ms']-record['tx_ms']
-            record['eeg_changed_received_s']=float(rx['arrival'][r]-origin-offset)
+            record['signal_changed_received_s']=float(rx['arrival'][r]-origin-offset)
         records.append(record)
     errors=[abs(r['delivery_error_ms']) for r in records if r['delivery_error_ms'] is not None]
     acq=[abs(r['acquisition_error_ms']) for r in records if r['acquisition_error_ms'] is not None]
@@ -645,6 +676,51 @@ def analyze_responses(cfg, sensor, tx, rx, txmarkers, rxmarkers, figures, origin
                 delivery_mismatch=sum(e>cfg['event_tolerance_ms'] for e in errors),
                 acquisition_mismatch=sum(e>cfg['event_tolerance_ms'] for e in acq),
                 acquisition_error_ms=distribution(acq),delivery_error_ms=distribution(errors),events=records)
+
+
+def stream_timing(events,reference='eeg'):
+    """Compare the same observed event across streams without fitting clocks."""
+    reference_events={e['marker_id']:e for e in events if e['stream']==reference}
+    result=[]
+    for event in events:
+        row=dict(event,reference_stream=reference,source_offset_ms=None,stored_offset_ms=None,
+                 stored_offset_error_ms=None,read_offset_ms=None)
+        other=reference_events.get(event['marker_id'])
+        if other and event['status']==other['status']=='detected':
+            row['source_offset_ms']=(event['signal_changed_sent_s']-other['signal_changed_sent_s'])*1000
+            row['stored_offset_ms']=(event['signal_sample_received_s']-other['signal_sample_received_s'])*1000
+            row['stored_offset_error_ms']=row['stored_offset_ms']-row['source_offset_ms']
+            row['read_offset_ms']=(event['signal_changed_received_s']-other['signal_changed_received_s'])*1000
+        result.append(row)
+    return result
+
+
+def plot_stream_timing(out,case,events,seconds):
+    import matplotlib.pyplot as plt
+    streams=list(dict.fromkeys(e['stream'] for e in events))
+    labels=list(dict.fromkeys(e['label'] for e in events))
+    colors={label:MARKER_COLORS[i%len(MARKER_COLORS)] for i,label in enumerate(labels)}
+    fig,axes=plt.subplots(2,1,figsize=(14,8),constrained_layout=True)
+    for ax,received_key,title in zip(axes,['signal_sample_received_s','signal_changed_received_s'],
+            ['Synchronization for analysis — sample times saved in each stream',
+             'When each change became available — actual receiver read times']):
+        for event in events:
+            if event['status']!='detected':continue
+            i=streams.index(event['stream']);color=colors[event['label']]
+            for key,y,style,fill in [('signal_changed_sent_s',2*i,'-',color),(received_key,2*i+1,'--','white')]:
+                stamp=event.get(key)
+                if stamp is None or not 0<=stamp<=seconds:continue
+                ax.vlines(stamp,y-.28,y+.28,color=color,linestyles=style,lw=3)
+                ax.plot(stamp,y,'o',ms=8,color=color,mfc=fill,mew=2)
+                if i==0 and key=='signal_changed_sent_s':
+                    ax.text(stamp,-.65,'Marker '+event['label'],color=color,ha='center',fontsize=10,weight='bold')
+        ax.set_yticks(range(2*len(streams)),[f'{s.upper()} — {kind}' for s in streams for kind in ('sent','received')])
+        ax.set(xlim=(0,seconds),ylim=(2*len(streams)-.4,-1.2),title=title,xlabel='Time from shared start (s)')
+        ax.grid(axis='x',alpha=.25)
+    fig.suptitle(f'{case} — the same known event in every sensor\n'
+                 'Same color = same event. Solid / filled = sent. Dashed / hollow = received. No curve shifting.',fontsize=11)
+    fig.savefig(Path(out)/f'{case}_sync_snapshot.png',dpi=115)
+    plt.close(fig)
 
 
 def analyze_marker_classes(cfg, txmarkers, rxmarkers, figures):
@@ -710,7 +786,7 @@ def analyze(directory, output_dir=None, case='case'):
             rx = dict(f)
         metrics, data = compare(tx, rx, s['rate'])
         report['sensors'][name] = metrics
-        if s['kind'].upper()=='EEG':
+        if s['kind'].upper()=='EEG' or cfg.get('shared_sensor_events'):
             metrics['responses']=analyze_responses(cfg,s,tx,rx,txmarkers,rxmarkers,figures,
                                                   origin=txmeta['start'],offset=anchor_offset or 0.)
         if data is not None:
@@ -728,6 +804,11 @@ def analyze(directory, output_dir=None, case='case'):
             metrics['issues'], metrics['limits'] = diagnose(metrics, [], cfg.get('analysis_limits'))
         if data is None:
             continue
+    reference=next((s['name'] for s in cfg['sensors'] if s['kind'].upper()=='EEG'),cfg['sensors'][0]['name'])
+    report['stream_timing']=stream_timing([dict(stream=name,**event)
+        for name,metrics in report['sensors'].items() for event in metrics.get('responses',{}).get('events',[])],reference)
+    if cfg.get('shared_sensor_events') and len(cfg['sensors'])>1:
+        plot_stream_timing(figures,case,report['stream_timing'],cfg.get('snapshot_seconds',2.))
     report['marker_classes']=analyze_marker_classes(cfg,txmarkers,rxmarkers,figures)
     for metrics in report['sensors'].values():
         for key in ('missing','duplicates'):
