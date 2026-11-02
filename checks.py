@@ -71,15 +71,15 @@ def test_two_experiment_plan_and_fixed_stream_parameters():
     cases = build_cases(settings)
     eeg = [cfg for experiment, _, cfg in cases if experiment == 'eeg']
     streams = [cfg for experiment, _, cfg in cases if experiment == 'streams']
-    assert len(eeg) == 60 and len(streams) == 9
+    assert len(eeg) == 72 and len(streams) == 9
     assert {(c['sensors'][0]['rate'], c['sensors'][0]['channels']) for c in eeg} == {
-        (rate, channels) for rate in [500,750,1000,1500,2048] for channels in [16,32,64,128]}
+        (rate, channels) for rate in [500,512,731.5,1000,1500,2048] for channels in [16,32,64,128]}
     assert [len(c['sensors']) for c in streams] == [1,1,1,2,2,2,3,3,3]
     assert streams[0]['sensors'][0] == streams[3]['sensors'][0] == streams[6]['sensors'][0]
     assert streams[3]['sensors'][1] == streams[6]['sensors'][1]
     assert {c['receiver_poll_hz'] for _,_,c in cases}=={2048}
     assert {c['chunk'] for _,_,c in cases}=={1}
-    assert [s['rate'] for s in streams[-1]['sensors']]==[500,2000,100]
+    assert [s['rate'] for s in streams[-1]['sensors']]==[512,2000,70]
     assert all(c['shared_sensor_events'] for c in streams)
 
 
@@ -355,10 +355,10 @@ def test_startup_plan_lists_all_cases_without_transmitting(tmp_path):
                            cwd=Path(__file__).parent,capture_output=True,text=True,timeout=30)
     assert process.returncode==0,process.stderr
     plan=list(csv.DictReader((output/'plan.csv').open()))
-    assert len(plan)==69 and all(p['status']=='planned' for p in plan)
+    assert len(plan)==81 and all(p['status']=='planned' for p in plan)
     assert all(float(p['estimate_low_s'])>=float(p['acquisition_s']) for p in plan)
     assert all(float(p['estimate_high_s'])>float(p['estimate_low_s']) for p in plan)
-    assert 'T1_60' in process.stdout and 'T2_09' in process.stdout
+    assert 'T1_72' in process.stdout and 'T2_09' in process.stdout
     assert (output/'summary.html').is_file()
     assert not list(output.rglob('*recording.npz'))
     assert not list(output.rglob('recordings.zip'))
@@ -858,3 +858,234 @@ def test_marker_colors_are_shared_between_sent_and_received_styles(tmp_path,monk
         segments=[line for line in lines if line.get_color()==color and len(line.get_xdata())==2]
         assert {'-','--'}<={line.get_linestyle() for line in segments}
         assert all(line.get_linewidth()>=2.5 for line in segments)
+
+
+@pytest.mark.parametrize('rates',[(512,2000,70),(511.7,1999.3,69.8)])
+def test_unrelated_sampling_rates_preserve_timing_without_accumulating_delay(tmp_path,rates):
+    from analysis import stream_timing
+    sensors=[dict(name=name,kind=kind,rate=rate,channels=1)
+             for name,kind,rate in zip(('eeg','emg','imu'),('EEG','EMG','IMU'),rates)]
+    cfg=validate(dict(duration=12,sensors=sensors))
+    events=marker_events(cfg)
+    txm=[dict(e,sample_time=100+e['nominal'],sent=100+e['nominal']) for e in events]
+    rxm=[dict(e,raw=e['sample_time'],corrected=e['sample_time']+7,arrival=e['sample_time']+7+.01) for e in txm]
+    measured=[]
+    for sensor in sensors:
+        rate=sensor['rate'];ids=np.arange(int(12*rate));source=100+ids/rate
+        values=signal(sensor['kind'],ids,rate,1,events,ids/rate)
+        tx=dict(ids=ids,sample=source,generated=source,sent=source,values=values)
+        rx=dict(ids=ids,raw=source,corrected=source+7,arrival=source+7+.01,
+                correction=np.full(len(ids),7.),values=values)
+        responses=analyze_responses(cfg,sensor,tx,rx,txm,rxm,tmp_path,origin=100,offset=7)
+        assert responses['detected']==18
+        measured.extend(dict(stream=sensor['name'],**e) for e in responses['events'])
+        metrics,_=compare(tx,rx,rate)
+        assert metrics['latency_change_ms']==pytest.approx(0,abs=1e-7)
+        assert metrics['missing']==0
+    for event in stream_timing(measured):
+        stream_rate=next(s['rate'] for s in sensors if s['name']==event['stream'])
+        assert -1000/rates[0]-1e-7<=event['source_offset_ms']<=1000/stream_rate+1e-7
+        assert event['stored_offset_error_ms']==pytest.approx(0,abs=1e-7)
+
+
+def write_xdf_fixture(path,streams):
+    """Small XDF with real binary chunks, original stamps and clock offsets."""
+    import struct
+    from xml.sax.saxutils import escape
+    def integer(value):return b'\x04'+struct.pack('<I',value)
+    def chunk(tag,payload):
+        content=struct.pack('<H',tag)+payload
+        return integer(len(content))+content
+    data=b'XDF:'+chunk(1,b'<info><version>1.0</version></info>')
+    for identity,stream in enumerate(streams,1):
+        channels=stream['values'].shape[1]
+        strings=stream.get('type')=='Markers'
+        channel_xml=''.join('<channel><label>'+escape(label)+'</label><unit>uV</unit></channel>' for label in stream.get('labels',[]))
+        header=(f'<info><name>{escape(stream["name"])}</name><type>{stream.get("type","EEG")}</type>'
+            f'<source_id>{stream.get("source_id","")}</source_id><uid>{stream.get("uid","")}</uid>'
+            f'<channel_count>{channels}</channel_count><nominal_srate>{0 if strings else 512}</nominal_srate>'
+            f'<channel_format>{"string" if strings else "float32"}</channel_format>'
+            f'<desc><channels>{channel_xml}</channels></desc></info>').encode()
+        data+=chunk(2,struct.pack('<I',identity)+header)
+        data+=chunk(4,struct.pack('<Idd',identity,100.,7.))
+        samples=struct.pack('<I',identity)+integer(len(stream['raw']))
+        for stamp,values in zip(stream['raw'],stream['values']):
+            samples+=b'\x08'+struct.pack('<d',stamp)
+            if strings:
+                for value in values:
+                    encoded=str(value).encode();samples+=integer(len(encoded))+encoded
+            else:samples+=np.asarray(values,dtype='<f4').tobytes()
+        data+=chunk(3,samples)
+    path.write_bytes(data)
+
+
+def real_capture_fixture(tmp_path):
+    import json
+    raw=100+np.array([0,.00217,.00403,.00631,.00811])
+    values=np.arange(10,dtype=np.float32).reshape(5,2)
+    marker_raw=np.array([100.002,100.002,100.006])
+    marker_values=np.array([['A'],['B'],['A']])
+    meta=dict(mode='real LSL capture',start=107.,end=108.,status='completed',error='',marker_status='recorded',
+        streams=dict(eeg=dict(name='test_eego',source_id='device',uid='same-session',channels=2,rate_hz=512,
+            labels=['Fz','Cz'],units=['uV','uV']),
+            marker=dict(name='PsychoPyMarkers',source_id='psychopy',uid='marker-session',channels=1,rate_hz=0,labels=[],units=[])))
+    arrays=dict(eeg_raw=raw,eeg_values=values,eeg_corrected=raw+7,eeg_arrival=raw+7.02,
+        marker_raw=marker_raw,marker_values=marker_values,marker_corrected=marker_raw+7,marker_arrival=marker_raw+7.01,
+        metadata_json=np.array(json.dumps(meta)))
+    recording=tmp_path/'recordings.npz';np.savez_compressed(recording,**arrays)
+    streams=[dict(meta['streams']['eeg'],raw=raw,values=values),
+             dict(meta['streams']['marker'],type='Markers',raw=marker_raw,values=marker_values)]
+    return recording,meta,arrays,streams
+
+
+def test_reference_matching_uses_overlap_and_preserves_missing_sample_evidence():
+    from real_eeg import match_samples,compare_values
+    paired=match_samples([1,2,4,5],[0,1,2,3,4,5,6])
+    assert paired['captured_in_range']==4 and paired['reference_in_range']==5
+    assert paired['unmatched_reference']==1 and paired['unmatched_captured']==0
+    captured=np.array([[1.,10],[2,20],[4,40],[5,50]])
+    reference=np.column_stack((np.arange(7),10*np.arange(7))).astype(float)
+    reference[4,1]+=3
+    rows=compare_values(captured,reference,paired,['Fz','Cz'])
+    assert rows[0]['different_values']==0 and rows[1]['max_difference']==3
+    with pytest.raises(ValueError,match='shared time range'):
+        match_samples([1,2],[101,102])
+    with pytest.raises(ValueError,match='strictly increasing'):
+        match_samples([1,1],[1,2])
+
+
+def test_real_reference_keeps_nonfinite_values_visible():
+    from real_eeg import match_samples,compare_values
+    pairs=match_samples([1,2],[1,2])
+    rows=compare_values(np.array([[1.,np.nan],[2,np.inf]]),np.array([[1.,np.nan],[3,np.inf]]),pairs,['Fz','Cz'])
+    assert rows[0]['different_values']==1 and rows[0]['max_difference']==1
+    assert rows[1]['nonfinite_pairs']==2 and rows[1]['max_difference'] is None
+
+
+def test_xdf_comparison_preserves_original_stamps_values_and_repeated_markers(tmp_path,monkeypatch):
+    pytest.importorskip('pyxdf')
+    import hashlib
+    import real_eeg
+    recording,meta,arrays,streams=real_capture_fixture(tmp_path)
+    reference=tmp_path/'labrecorder.xdf';write_xdf_fixture(reference,streams)
+    loaded,_=real_eeg.load_reference(reference,meta)
+    np.testing.assert_array_equal(loaded['eeg']['raw'],arrays['eeg_raw'])
+    np.testing.assert_array_equal(loaded['eeg']['values'],arrays['eeg_values'])
+    original=hashlib.sha256(recording.read_bytes()).digest()
+    monkeypatch.setattr(real_eeg,'_image',lambda fig:'data:image/png;base64,')
+    result=real_eeg.compare(recording,reference)
+    assert result['paired']['unmatched_captured']==result['paired']['unmatched_reference']==0
+    assert all(r['different_values']==0 for r in result['rows'])
+    assert len(result['markers']['captured'])==3 and result['markers']['different_values']==0
+    assert np.max(np.abs(result['timestamp_difference_ms']))==0
+    assert hashlib.sha256(recording.read_bytes()).digest()==original
+    report=(tmp_path/'summary.html').read_text()
+    assert 'lang="en"' in report and 'No resampling' in report
+    assert 'original timestamps' in report and 'physical stimulus timing' in report
+
+
+@pytest.mark.parametrize('reference_labels',[['Cz','Fz'],['Cz','']])
+def test_reference_rejects_changed_channel_order_without_modifying_recording(tmp_path,reference_labels):
+    pytest.importorskip('pyxdf')
+    from real_eeg import compare
+    recording,meta,arrays,streams=real_capture_fixture(tmp_path)
+    streams[0]['labels']=reference_labels
+    reference=tmp_path/'swapped.xdf';write_xdf_fixture(reference,streams)
+    original=recording.read_bytes()
+    with pytest.raises(ValueError,match='labels/order differ'):
+        compare(recording,reference)
+    assert recording.read_bytes()==original
+    assert not (tmp_path/'summary.html').exists()
+
+
+def test_xdf_reference_detects_a_changed_marker_value(tmp_path,monkeypatch):
+    pytest.importorskip('pyxdf')
+    import real_eeg
+    recording,meta,arrays,streams=real_capture_fixture(tmp_path)
+    streams[1]['values']=np.array([['A'],['C'],['A']])
+    reference=tmp_path/'changed-marker.xdf';write_xdf_fixture(reference,streams)
+    monkeypatch.setattr(real_eeg,'_image',lambda fig:'data:image/png;base64,')
+    result=real_eeg.compare(recording,reference)
+    assert result['markers']['different_values']==1
+
+
+def test_real_eeg_plan_uses_device_name_without_connecting(tmp_path):
+    import subprocess,sys,json
+    process=subprocess.run([sys.executable,'main.py','--real-eeg','--plan-only','--duration','3'],
+        cwd=Path(__file__).parent,capture_output=True,text=True,timeout=15)
+    assert process.returncode==0,process.stderr
+    plan=json.loads(process.stdout)
+    assert plan['stream_name']=='EE225-020034-000905_on_DESKTOP-U197OKE'
+    assert plan['duration_s']==3 and plan['buffer_s']==60
+
+
+def test_real_capture_interrupt_saves_original_channels_and_timestamps(tmp_path,monkeypatch):
+    import json
+    import pylsl
+    import real_eeg
+    import matplotlib.pyplot as plt
+    info=pylsl.StreamInfo('interrupt-check','EEG',2,512,'double64','interrupt-source')
+    pulls=[];closed=[];clock=[100.]
+    class Inlet:
+        def __init__(self,selected,**kwargs):assert kwargs['processing_flags']==0
+        def open_stream(self,**kwargs):pass
+        def time_correction(self,**kwargs):return 7.
+        def info(self,**kwargs):return info
+        def flush(self):return 0
+        def close_stream(self):closed.append(True)
+        def pull_chunk(self,**kwargs):
+            if pulls:raise KeyboardInterrupt
+            pulls.append(True)
+            return [[1.123456789,2.],[3.,4.]],[93.01,93.012]
+    def tick():clock[0]+=.001;return clock[0]
+    monkeypatch.setattr(pylsl,'StreamInlet',Inlet)
+    monkeypatch.setattr(pylsl,'resolve_byprop',lambda prop,value,**kwargs:[info] if prop=='name' else [])
+    monkeypatch.setattr(pylsl,'resolve_streams',lambda **kwargs:[])
+    monkeypatch.setattr(pylsl,'local_clock',tick)
+    monkeypatch.setattr(real_eeg.time,'sleep',lambda seconds:None)
+    monkeypatch.setattr(real_eeg,'_image',lambda figure:(plt.close(figure) or 'data:image/png;base64,'))
+    cfg=json.loads(Path('config.json').read_text())['real_eeg'];cfg['stream_name']='interrupt-check'
+    recording=real_eeg.capture(cfg,tmp_path/'capture')
+    with np.load(recording,allow_pickle=False) as data:
+        np.testing.assert_array_equal(data['eeg_values'],[[1.123456789,2.],[3.,4.]])
+        np.testing.assert_array_equal(data['eeg_raw'],[93.01,93.012])
+        np.testing.assert_allclose(data['eeg_corrected'],[100.01,100.012])
+        assert json.loads(str(data['metadata_json']))['status']=='stopped by user'
+    assert closed
+
+
+def test_real_capture_preserves_existing_results_before_any_connection(tmp_path,monkeypatch):
+    import json
+    import pylsl
+    from real_eeg import capture
+    sentinel=tmp_path/'previous.txt';sentinel.write_text('keep previous data')
+    def unexpected(*args,**kwargs):raise AssertionError('Existing output must be checked before device discovery')
+    monkeypatch.setattr(pylsl,'resolve_byprop',unexpected)
+    cfg=json.loads(Path('config.json').read_text())['real_eeg']
+    with pytest.raises(ValueError,match='empty'):
+        capture(cfg,tmp_path)
+    assert sentinel.read_text()=='keep previous data'
+
+
+def test_xdf_reference_rejects_a_different_outlet_session(tmp_path):
+    pytest.importorskip('pyxdf')
+    from real_eeg import load_reference
+    recording,meta,arrays,streams=real_capture_fixture(tmp_path)
+    streams[0]['uid']='different-outlet-session'
+    reference=tmp_path/'different-session.xdf';write_xdf_fixture(reference,streams)
+    with pytest.raises(ValueError,match='matching eeg stream'):
+        load_reference(reference,meta)
+
+
+def test_real_marker_discovery_does_not_guess_between_multiple_outlets(tmp_path,monkeypatch):
+    import json
+    import pylsl
+    from real_eeg import capture
+    eeg=pylsl.StreamInfo('test_eego','EEG',2,512,'double64','device')
+    markers=[pylsl.StreamInfo(name,'Markers',1,0,'string',name) for name in ('task1','task2')]
+    monkeypatch.setattr(pylsl,'resolve_byprop',lambda *args,**kwargs:[eeg])
+    monkeypatch.setattr(pylsl,'resolve_streams',lambda **kwargs:markers)
+    cfg=json.loads(Path('config.json').read_text())['real_eeg']
+    with pytest.raises(ValueError,match='Multiple marker streams'):
+        capture(cfg,tmp_path/'not-created')
+    assert not (tmp_path/'not-created').exists()
