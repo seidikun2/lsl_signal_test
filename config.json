@@ -1,5 +1,5 @@
 {
-  "active_suite": "local",
+  "active_suite": "normal",
   "local_tests": {
     "duration_s": 30,
     "repeats": 6,
@@ -55,10 +55,10 @@
       "chunks": [16],
       "buffers_s": [60],
       "pauses_s": [0],
-      "repeats": 1
+      "repeats": 3
     },
     "streams": {
-      "repeats": 1
+      "repeats": 3
     }
   },
   "acquisition": {

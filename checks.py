@@ -71,12 +71,12 @@ def test_two_experiment_plan_and_fixed_stream_parameters():
     cases = build_cases(settings)
     eeg = [cfg for experiment, _, cfg in cases if experiment == 'eeg']
     streams = [cfg for experiment, _, cfg in cases if experiment == 'streams']
-    assert len(eeg) == 36 and len(streams) == 3
+    assert len(eeg) == 108 and len(streams) == 9
     assert {(c['sensors'][0]['rate'], c['sensors'][0]['channels']) for c in eeg} == {
         (rate, channels) for rate in [64,128,256,512,1024,2048,4096,8192,16384] for channels in [16,32,64,128]}
-    assert [len(c['sensors']) for c in streams] == [1,2,3]
-    assert streams[0]['sensors'][0] == streams[1]['sensors'][0] == streams[2]['sensors'][0]
-    assert streams[1]['sensors'][1] == streams[2]['sensors'][1]
+    assert [len(c['sensors']) for c in streams] == [1,1,1,2,2,2,3,3,3]
+    assert streams[0]['sensors'][0] == streams[3]['sensors'][0] == streams[6]['sensors'][0]
+    assert streams[3]['sensors'][1] == streams[6]['sensors'][1]
 
 
 def test_exact_sample_count_with_different_rates():
@@ -351,12 +351,13 @@ def test_startup_plan_lists_all_cases_without_transmitting(tmp_path):
                            cwd=Path(__file__).parent,capture_output=True,text=True,timeout=30)
     assert process.returncode==0,process.stderr
     plan=list(csv.DictReader((output/'plan.csv').open()))
-    assert len(plan)==39 and all(p['status']=='planned' for p in plan)
+    assert len(plan)==117 and all(p['status']=='planned' for p in plan)
     assert all(float(p['estimate_low_s'])>=float(p['acquisition_s']) for p in plan)
     assert all(float(p['estimate_high_s'])>float(p['estimate_low_s']) for p in plan)
-    assert 'T1_36' in process.stdout and 'T2_03' in process.stdout
-    assert (output/'plan.png').is_file() and (output/'summary.html').is_file()
+    assert 'T1_108' in process.stdout and 'T2_09' in process.stdout
+    assert (output/'summary.html').is_file()
     assert not list(output.rglob('*recording.npz'))
+    assert not list(output.rglob('recordings.zip'))
 
 
 # Queue overload checks use whole executions and actual queue telemetry, not clock drift.
@@ -717,3 +718,55 @@ def test_report_and_every_plot_label_are_english(tmp_path,monkeypatch):
     for forbidden in ('aquisição','Atraso','Crescimento','fila crescente','execuções','amostras','Carga'):
         assert forbidden not in markup
         assert all(forbidden not in label for label in labels)
+
+
+def test_time_counters_preserve_delay_instead_of_aligning_first_arrivals():
+    from analysis import recorded_time_vectors
+    tx,rx=fixture(delay=.2)
+    tx['sender_time_s']=tx['sample']-100
+    tx['sender_send_time_s']=tx['sender_time_s']+.01
+    rx['sender_time_s']=tx['sender_time_s'].copy()
+    rx['receiver_time_s']=rx['arrival']-107
+    sent,carried,received=recorded_time_vectors(tx,rx,100,7)
+    assert received[0]==pytest.approx(.2) # not reset to zero at first read
+    np.testing.assert_array_equal(sent,carried)
+    metrics,_=compare(tx,rx,100)
+    assert metrics['counter_error_ms']==0
+    assert metrics['counter_delay_ms']['median']==pytest.approx(200)
+    assert metrics['counter_after_send_ms']['median']==pytest.approx(190)
+    rx['sender_time_s'][3]+=.005
+    assert compare(tx,rx,100)[0]['counter_error_ms']==pytest.approx(5)
+
+
+def test_marker_result_contains_actual_sender_and_receiver_time_vectors(tmp_path):
+    cfg,sensor,tx,rx,txm,rxm=event_fixture()
+    result=analyze_responses(cfg,sensor,tx,rx,txm,rxm,tmp_path,origin=100,offset=7)
+    first=result['events'][0]
+    assert first['marker_sent_s']==pytest.approx(.3)
+    assert first['eeg_changed_sent_s']==pytest.approx(.5)
+    assert first['marker_received_s']==pytest.approx(.31)
+    assert first['eeg_changed_received_s']==pytest.approx(.55)
+    assert first['delivery_error_ms']==pytest.approx(40)
+    assert first['acquisition_error_ms']==pytest.approx(0,abs=1e-7)
+
+
+def test_heatmap_does_not_turn_failed_or_unrun_cases_into_zero():
+    from analysis import result_matrix
+    rows=[dict(rate_hz=128,channels=16,status='completed',missing=0,expected=100),
+          dict(rate_hz=256,channels=16,status='failed',missing=0,expected=100)]
+    matrix,failed=result_matrix(rows,'missing_pct',[128,256,512],[16],'rate_hz','channels')
+    assert matrix[0,0]==0
+    assert np.isnan(matrix[0,1:]).all()
+    np.testing.assert_array_equal(failed,[[False,True,False]])
+
+
+def test_normal_report_shows_eeg_then_extra_signals_before_optional_analysis(tmp_path):
+    from analysis import write_results_report
+    plan=[dict(case='T1_01',test=1,status='completed'),dict(case='T2_01',test=2,status='completed')]
+    write_results_report(tmp_path,plan,[],[],{},{},{})
+    text=(tmp_path/'summary.html').read_text()
+    assert text.index('Test 1 — EEG only')<text.index('Test 2 — adding signals')<text.index('After viewing the results')
+    assert 'lang="en"' in text
+    assert 'imshow' not in text # implementation details stay out of the report
+    assert 'Nominal load' not in text and 'wall time' not in text.lower()
+    assert text.index('Extra tests — slow processing and recovery')>text.index('Every recorded result')

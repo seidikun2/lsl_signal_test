@@ -162,74 +162,167 @@ def write_plan(root,plan,image=False,console=False):
         plt.close(fig)
 
 
+def _image_data(path):
+    import base64
+    return 'data:image/png;base64,'+base64.b64encode(Path(path).read_bytes()).decode()
+
+
+def _collect_normal(case,cfg,report,rows,events):
+    from analysis import case_result
+    for sensor in cfg['sensors']:
+        metrics=report['sensors'][sensor['name']]
+        rows.append(case_result(case,cfg,sensor,metrics))
+        if sensor['kind'].upper()=='EEG':
+            for event in metrics.get('responses',{}).get('events',[]):
+                events.append(dict(case=case,test=1 if cfg['experiment']=='eeg' else 2,stream=sensor['name'],**event))
+
+
+def _normal_views(root,work,plan,rows,events,assets,machine,finished=False):
+    from analysis import write_eeg_matrix,write_stream_matrix,write_results_report
+    maps={}
+    if finished:
+        directory=Path(work)/'maps';directory.mkdir(exist_ok=True)
+        eeg=[r for r in rows if r['experiment']=='eeg']
+        streams=[r for r in rows if r['experiment']=='streams']
+        if eeg:write_eeg_matrix(directory,eeg,plan)
+        if streams:write_stream_matrix(directory,streams)
+        for path in directory.glob('*.png'):
+            maps[path.stem]=_image_data(path)
+    write_csv(root/'metrics.csv',rows)
+    write_csv(root/'markers.csv',events)
+    # Keep the four-file layout even when a failed run produced no rows.
+    for name in ('metrics.csv','markers.csv'):
+        if not (root/name).exists():(root/name).write_text('case,status\n')
+    write_results_report(root,plan,rows,events,assets,maps,machine)
+
+
+def normal_experiment(config,output=None,plan_only=False):
+    import json,platform,tempfile,zipfile
+    from analysis import case_result,write_results_report
+    document=json.loads(Path(config).read_text())
+    cases=build_cases(read_settings(config));plan=make_plan(cases)
+    low=sum(p['estimate_low_s'] for p in plan);high=sum(p['estimate_high_s'] for p in plan)
+    print(f'Test 1: {sum(p["test"]==1 for p in plan)} EEG cases. Test 2: {sum(p["test"]==2 for p in plan)} additional-signal cases.',flush=True)
+    note='No added processing wait.' if all(c[2]['receiver_pause']==0 for c in cases) else 'An extra receiver pause is configured.'
+    print(f'Estimated total: {low/60:.1f}–{high/60:.1f} minutes, including setup and recording. {note}',flush=True)
+    if plan_only:
+        for p in plan:print(f'{p["case"]}: {p["sensors"]}, {p["rates_hz"]} Hz, {p["channels"]} channels',flush=True)
+        if output:
+            root=Path(output);root.mkdir(parents=True,exist_ok=True)
+            if any(root.iterdir()):raise ValueError('Plan output must be empty')
+            write_csv(root/'plan.csv',plan)
+            write_results_report(root,plan,[],[],{},{},{})
+        return
+    root=prepare_results(output or Path(__file__).with_name('results'))
+    machine=dict(system=platform.system(),release=platform.release(),python=platform.python_version(),architecture=platform.machine(),started_utc=datetime.now(timezone.utc).isoformat())
+    machine['label']=document.get('run_label','')
+    archive=root/'recordings.zip'
+    with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_STORED) as bundle:
+        bundle.writestr('settings.json',json.dumps(document))
+        bundle.writestr('plan.json',json.dumps(plan))
+        bundle.writestr('machine.json',json.dumps(machine))
+    rows=[];events=[];assets={};errors={}
+    with tempfile.TemporaryDirectory(prefix='lsl_results_') as temporary:
+        work=Path(temporary)
+        _normal_views(root,work,plan,rows,events,assets,machine)
+        for i,(_,_,cfg) in enumerate(cases):
+            item=plan[i];case=item['case'];item['status']='running'
+            directory=work/case;directory.mkdir()
+            print(f'[{i+1}/{len(plan)}] {case}: {item["sensors"]}, {item["rates_hz"]} Hz, {item["channels"]} channels',flush=True)
+            began=time.monotonic()
+            try:
+                report=run(cfg,directory,case)
+                if not report['tx_complete'] or not report['rx_complete']:raise RuntimeError('Recording ended before both scripts completed')
+                _collect_normal(case,cfg,report,rows,events)
+                item['status']='completed'
+            except Exception as error:
+                item['status']='failed';item['error']=str(error);errors[case]=str(error)
+                for sensor in cfg['sensors']:rows.append(case_result(case,cfg,sensor,error=str(error)))
+                print(f'FAILED: {error}',flush=True)
+            finally:
+                recording=directory/f'{case}_recording.npz'
+                if recording.exists():
+                    with zipfile.ZipFile(archive,'a',compression=zipfile.ZIP_STORED) as bundle:bundle.write(recording,case+'.npz')
+            item['actual_s']=time.monotonic()-began
+            for path in directory.glob('*_snapshot.png'):
+                assets[path.stem.removesuffix('_snapshot')]=_image_data(path)
+            _normal_views(root,work,plan,rows,events,assets,machine)
+            import shutil
+            shutil.rmtree(directory)
+            print(f'{case}: {item["status"]}',flush=True)
+        with zipfile.ZipFile(archive,'a') as bundle:bundle.writestr('finished.json',json.dumps(dict(errors=errors)))
+        _normal_views(root,work,plan,rows,events,assets,machine,finished=True)
+    print(f'Results: {root/"summary.html"}',flush=True)
+    if errors:raise RuntimeError('Some recordings failed; see the result table')
+
+
+def reanalyze_normal(recording,output=None):
+    import json,tempfile,zipfile,shutil
+    from analysis import analyze,case_result
+    from helpers import unpack_recording
+    recording=Path(recording)
+    root=Path(output) if output else recording.parent
+    if output:
+        root.mkdir(parents=True,exist_ok=True)
+        if any(root.iterdir()):raise ValueError('Reanalysis output must be empty')
+    rows=[];events=[];assets={}
+    with zipfile.ZipFile(recording) as bundle,tempfile.TemporaryDirectory(prefix='lsl_reanalysis_') as temporary:
+        work=Path(temporary)
+        document=json.loads(bundle.read('settings.json'))
+        plan=json.loads(bundle.read('plan.json'));machine=json.loads(bundle.read('machine.json'))
+        by_id={p['case']:p for p in plan}
+        errors=json.loads(bundle.read('finished.json')).get('errors',{}) if 'finished.json' in bundle.namelist() else {}
+        names=[n for n in bundle.namelist() if n.endswith('.npz')]
+        if len(names)!=len(set(names)):raise ValueError('Archive contains duplicate case names')
+        for name in names:
+            case=Path(name).stem
+            if name!=case+'.npz' or case not in by_id:raise ValueError('Unexpected case in recording archive')
+            item=by_id[case];directory=work/case;directory.mkdir()
+            saved=directory/'recording.npz';saved.write_bytes(bundle.read(name))
+            unpack_recording(saved,directory)
+            cfg=json.loads((directory/'config.json').read_text())
+            if json.loads((directory/'run.json').read_text())['case']!=case:raise ValueError('Recording case ID mismatch')
+            try:
+                report=analyze(directory,directory,case)
+                if not report['tx_complete'] or not report['rx_complete']:raise RuntimeError('Incomplete recording')
+                if case in errors:raise RuntimeError(errors[case])
+                _collect_normal(case,cfg,report,rows,events)
+                item['status']='completed'
+            except Exception as error:
+                item['status']='failed';item['error']=str(error)
+                for sensor in cfg['sensors']:rows.append(case_result(case,cfg,sensor,error=str(error)))
+            for path in directory.glob('*_snapshot.png'):
+                assets[path.stem.removesuffix('_snapshot')]=_image_data(path)
+            shutil.rmtree(directory)
+        _normal_views(root,work,plan,rows,events,assets,machine,finished=True)
+    if output:shutil.copy2(recording,root/'recordings.zip')
+    print(f'Results: {root/"summary.html"}')
+
+
 def main():
-    parser=argparse.ArgumentParser(description='Run the simulation configured in config.json')
+    import json
+    parser=argparse.ArgumentParser(description='Record EEG and additional signals; show results before analysis')
     parser.add_argument('--config',default=str(Path(__file__).with_name('config.json')))
-    parser.add_argument('--out',help='Optional fresh output directory')
-    parser.add_argument('--plan-only',action='store_true',help='Show and save the plan without transmitting')
-    parser.add_argument('--signals',action='store_true',help='Run the original signal/marker experiments instead of buffer stress tests')
-    parser.add_argument('--local',action='store_true',help='Long boundary, continuous recovery and incremental-stream experiments for the target machine')
-    parser.add_argument('--reanalyze',help='Regenerate the buffer report from a recordings.npz file without transmitting')
+    parser.add_argument('--out',help='Fresh output directory')
+    parser.add_argument('--plan-only',action='store_true',help='Show the plan without transmitting or replacing results')
+    parser.add_argument('--signals',action='store_true',help='Run normal signal and marker tests')
+    parser.add_argument('--local',action='store_true',help='Run separate extra tests with deliberately slow processing')
+    parser.add_argument('--reanalyze',help='Rebuild results from recordings.zip or the older buffering recordings.npz')
     args=parser.parse_args()
-    if args.local and (args.signals or args.reanalyze):
-        parser.error('--local cannot be combined with --signals or --reanalyze')
+    if args.local and (args.signals or args.reanalyze):parser.error('--local cannot be combined with --signals or --reanalyze')
     if args.reanalyze:
-        if args.signals or args.plan_only:
-            parser.error('--reanalyze cannot be combined with --signals or --plan-only')
-        from buffering import reanalyze
-        reanalyze(args.reanalyze, args.out)
+        if args.signals or args.plan_only:parser.error('--reanalyze cannot be combined with --signals or --plan-only')
+        if Path(args.reanalyze).suffix.lower()=='.zip':reanalyze_normal(args.reanalyze,args.out)
+        else:
+            from buffering import reanalyze
+            reanalyze(args.reanalyze,args.out)
         return
-    if not args.signals:
+    mode=json.loads(Path(args.config).read_text()).get('active_suite','normal')
+    if args.signals or (not args.local and mode=='normal'):
+        normal_experiment(args.config,args.out,args.plan_only)
+    else:
         from buffering import experiment
-        experiment(args.config, args.out, args.plan_only, local=args.local)
-        return
-    cases=build_cases(read_settings(args.config))
-    root=prepare_results(args.out or Path(__file__).with_name('results'))
-    plan=make_plan(cases)
-    from analysis import case_result,write_metrics,write_eeg_matrix,write_flat_comparison,write_report
-    rows=[]; event_rows=[]; marker_rows=[]
-    write_plan(root,plan,image=True,console=True)
-    write_report(root,plan,rows,event_rows,marker_rows)
-    if args.plan_only: return
-    for index,(_,_,cfg) in enumerate(cases):
-        item=plan[index]; case=item['case']; directory=root/f'test_{item["test"]}'
-        directory.mkdir(exist_ok=True)
-        item['status']='running'
-        write_plan(root,plan); write_report(root,plan,rows,event_rows,marker_rows)
-        print(f'Running {case} ({index+1}/{len(cases)})...',flush=True)
-        began=time.monotonic()
-        try:
-            report=run(cfg,directory,case)
-            for sensor in cfg['sensors']:
-                metric=report['sensors'][sensor['name']]
-                rows.append(case_result(case,cfg,sensor,metric))
-                for event in metric.get('responses',{}).get('events',[]):
-                    event_rows.append(dict(case=case,test=item['test'],stream=sensor['name'],**event))
-            for label,m in report['marker_classes'].items():
-                marker_rows.append(dict(case=case,test=item['test'],**{'class':label},expected=m['expected'],received=m['received'],
-                    missing=m['missing'],duplicates=m['duplicates'],expected_ms=m['interval_s']*1000,
-                    tx_ms=m['tx_interval_ms']['median'],rx_acquisition_ms=m['rx_acquisition_interval_ms']['median'],
-                    rx_delivery_ms=m['rx_delivery_interval_ms']['median']))
-            item['status']='completed'
-        except Exception as error:
-            item['status']='failed'; item['error']=str(error)
-            for sensor in cfg['sensors']: rows.append(case_result(case,cfg,sensor,error=str(error)))
-            print(f'[FAILED] {case}: {error}',flush=True)
-        item['actual_s']=time.monotonic()-began
-        selected=[r for r in rows if r['experiment']==cfg['experiment']]
-        write_metrics(directory,selected)
-        write_csv(directory/'events.csv',[r for r in event_rows if r['test']==item['test']])
-        write_csv(directory/'markers.csv',[r for r in marker_rows if r['test']==item['test']])
-        write_plan(root,plan); write_report(root,plan,rows,event_rows,marker_rows)
-        print(f'{case}: {item["status"]} in {item["actual_s"]:.1f}s',flush=True)
-    for experiment,number in [('eeg',1),('streams',2)]:
-        selected=[r for r in rows if r['experiment']==experiment]
-        if selected:
-            if experiment=='eeg': write_eeg_matrix(root/f'test_{number}',selected)
-            else: write_flat_comparison(root/f'test_{number}',selected)
-    write_plan(root,plan,image=True); write_report(root,plan,rows,event_rows,marker_rows)
-    print(f'Open {root}/summary.html in a browser',flush=True)
-    if any(p['status']=='failed' for p in plan): raise RuntimeError('Some cases failed; see the complete summary')
+        experiment(args.config,args.out,args.plan_only,local=args.local)
 
 
 if __name__=='__main__':
