@@ -71,12 +71,16 @@ def test_two_experiment_plan_and_fixed_stream_parameters():
     cases = build_cases(settings)
     eeg = [cfg for experiment, _, cfg in cases if experiment == 'eeg']
     streams = [cfg for experiment, _, cfg in cases if experiment == 'streams']
-    assert len(eeg) == 108 and len(streams) == 9
+    assert len(eeg) == 60 and len(streams) == 9
     assert {(c['sensors'][0]['rate'], c['sensors'][0]['channels']) for c in eeg} == {
-        (rate, channels) for rate in [64,128,256,512,1024,2048,4096,8192,16384] for channels in [16,32,64,128]}
+        (rate, channels) for rate in [500,750,1000,1500,2048] for channels in [16,32,64,128]}
     assert [len(c['sensors']) for c in streams] == [1,1,1,2,2,2,3,3,3]
     assert streams[0]['sensors'][0] == streams[3]['sensors'][0] == streams[6]['sensors'][0]
     assert streams[3]['sensors'][1] == streams[6]['sensors'][1]
+    assert {c['receiver_poll_hz'] for _,_,c in cases}=={2048}
+    assert {c['chunk'] for _,_,c in cases}=={1}
+    assert [s['rate'] for s in streams[-1]['sensors']]==[500,2000,100]
+    assert all(c['shared_sensor_events'] for c in streams)
 
 
 def test_exact_sample_count_with_different_rates():
@@ -351,10 +355,10 @@ def test_startup_plan_lists_all_cases_without_transmitting(tmp_path):
                            cwd=Path(__file__).parent,capture_output=True,text=True,timeout=30)
     assert process.returncode==0,process.stderr
     plan=list(csv.DictReader((output/'plan.csv').open()))
-    assert len(plan)==117 and all(p['status']=='planned' for p in plan)
+    assert len(plan)==69 and all(p['status']=='planned' for p in plan)
     assert all(float(p['estimate_low_s'])>=float(p['acquisition_s']) for p in plan)
     assert all(float(p['estimate_high_s'])>float(p['estimate_low_s']) for p in plan)
-    assert 'T1_108' in process.stdout and 'T2_09' in process.stdout
+    assert 'T1_60' in process.stdout and 'T2_09' in process.stdout
     assert (output/'summary.html').is_file()
     assert not list(output.rglob('*recording.npz'))
     assert not list(output.rglob('recordings.zip'))
@@ -610,20 +614,20 @@ def test_declared_bandwidth_rejects_aliasing_without_using_display_grid_as_acqui
     assert validate(dict(sensors=[sensor]))['sensors'][0]['rate']==256
 
 
-def test_local_extreme_sweep_includes_16384_with_and_without_other_streams():
+def test_optional_rate_sweep_keeps_other_sensor_parameters_fixed():
     from buffering import local_plan
     doc=local_document()
-    doc['local_tests'].update(rates_hz=[64,16384],stream_eeg_rates_hz=[512,16384],rate_repeats=2)
+    doc['local_tests'].update(rates_hz=[500,2048],stream_eeg_rates_hz=[500,2048],rate_repeats=2)
     cfg,plan=local_plan(doc)
     assert len(plan)==20
     native=[r for r in plan if r['axis']=='rate_native']
-    assert {r['rate_hz'] for r in native}=={64,16384}
+    assert {r['rate_hz'] for r in native}=={500,2048}
     assert all(r['processing_s_per_sample']==0 for r in native)
     mixed=[r for r in plan if r['axis']=='streams_rate']
     for r in mixed:
         assert r['sensors'][0]['rate']==r['value']
         assert r['sensors'][1:]==doc['acquisition']['sensors'][1:]
-    assert cfg['reconstruction_rate_hz']==16384
+    assert cfg['reconstruction_rate_hz']==2048
 
 
 def test_short_preview_preserves_measured_corruption_and_drops_full_waveform():
@@ -743,9 +747,10 @@ def test_marker_result_contains_actual_sender_and_receiver_time_vectors(tmp_path
     result=analyze_responses(cfg,sensor,tx,rx,txm,rxm,tmp_path,origin=100,offset=7)
     first=result['events'][0]
     assert first['marker_sent_s']==pytest.approx(.3)
-    assert first['eeg_changed_sent_s']==pytest.approx(.5)
+    assert first['signal_changed_sent_s']==pytest.approx(.5)
     assert first['marker_received_s']==pytest.approx(.31)
-    assert first['eeg_changed_received_s']==pytest.approx(.55)
+    assert first['signal_changed_received_s']==pytest.approx(.55)
+    assert first['signal_sample_received_s']==pytest.approx(.5)
     assert first['delivery_error_ms']==pytest.approx(40)
     assert first['acquisition_error_ms']==pytest.approx(0,abs=1e-7)
 
@@ -770,3 +775,86 @@ def test_normal_report_shows_eeg_then_extra_signals_before_optional_analysis(tmp
     assert 'imshow' not in text # implementation details stay out of the report
     assert 'Nominal load' not in text and 'wall time' not in text.lower()
     assert text.index('Extra tests — slow processing and recovery')>text.index('Every recorded result')
+
+
+def test_fixed_live_clock_preserves_delay_and_does_not_drop_recorded_samples():
+    from analysis import live_view
+    grids=[]
+    for rate in (500,2048):
+        ids=np.arange(int(rate*.1))
+        source=ids/rate
+        # Several samples may share a read; the full recording keeps them all.
+        reads=np.ceil((source+.004)*2048)/2048
+        tx=dict(ids=ids,sample=100+source,generated=100+source,sent=100+source,
+                sender_time_s=source,values=ids[:,None])
+        rx=dict(ids=ids,raw=100+source,corrected=107+source,arrival=107+reads,
+                correction=np.full(len(ids),7.),sender_time_s=source,receiver_time_s=reads,values=ids[:,None])
+        grid,sent,available=live_view(tx,rx,100,7,2048,.1,0)
+        grids.append(grid)
+        assert np.isnan(available[grid<.004]).all()
+        present=np.isfinite(available)
+        # No value can appear before its actual measured read.
+        assert np.all(reads[available[present].astype(int)]<=grid[present]+1e-9)
+        metrics,_=compare(tx,rx,rate)
+        assert metrics['received']==metrics['expected']==len(ids)
+        assert metrics['missing']==0 and metrics['rmse']==0
+    np.testing.assert_array_equal(*grids)
+
+
+def test_shared_event_sync_separates_native_sampling_from_added_timing_error(tmp_path):
+    from analysis import stream_timing
+    sensors=[dict(name='eeg',kind='EEG',rate=500,channels=1),
+             dict(name='emg',kind='EMG',rate=2000,channels=1),
+             dict(name='imu',kind='IMU',rate=100,channels=1)]
+    cfg=validate(dict(duration=1,sensors=sensors,markers=[
+        dict(label='A',interval=2,first=.303,delay=.2,width=.08,amplitude=1)]))
+    events=marker_events(cfg)
+    txm=[dict(e,sample_time=100+e['nominal'],sent=100+e['nominal']) for e in events]
+    rxm=[dict(e,raw=e['sample_time'],corrected=e['sample_time']+7,arrival=e['sample_time']+7+.01) for e in txm]
+    combined=[]
+    for sensor in sensors:
+        rate=sensor['rate'];ids=np.arange(rate);source=100+ids/rate
+        values=signal(sensor['kind'],ids,rate,1,events,ids/rate)
+        shift=.008 if sensor['name']=='imu' else 0
+        tx=dict(ids=ids,sample=source,values=values)
+        rx=dict(ids=ids,raw=source,corrected=source+7+shift,arrival=source+7+.02+shift,values=values)
+        response=analyze_responses(cfg,sensor,tx,rx,txm,rxm,tmp_path,origin=100,offset=7)
+        assert response['detected']==1
+        combined.extend(dict(stream=sensor['name'],**e) for e in response['events'])
+    measured=stream_timing(combined)
+    imu=next(e for e in measured if e['stream']=='imu')
+    assert imu['source_offset_ms']==pytest.approx(6)
+    assert imu['stored_offset_ms']==pytest.approx(14)
+    assert imu['stored_offset_error_ms']==pytest.approx(8)
+    assert imu['read_offset_ms']==pytest.approx(14)
+    combined[-1]['status']='onset_lost'
+    assert stream_timing(combined)[-1]['stored_offset_error_ms'] is None
+
+
+def test_reading_cadence_counts_empty_reads_and_reports_actual_gaps():
+    tx,rx=fixture()
+    rx['read_attempt_time_s']=np.r_[np.arange(10)/1000,.020]
+    result,_=compare(tx,rx,100)
+    assert result['receiver_measured_hz']==pytest.approx(500)
+    assert result['read_gap_ms']['max']==pytest.approx(11)
+
+
+def test_marker_colors_are_shared_between_sent_and_received_styles(tmp_path,monkeypatch):
+    import matplotlib.figure
+    from analysis import plot_snapshot,MARKER_COLORS
+    cfg,sensor,tx,rx,txm,rxm=event_fixture()
+    tx['sent']=tx['sample']+.001
+    cfg['reconstruction_rate_hz']=2048
+    response=analyze_responses(cfg,sensor,tx,rx,txm,rxm,tmp_path,origin=100,offset=7)
+    figures=[]
+    monkeypatch.setattr(matplotlib.figure.Figure,'savefig',lambda self,*a,**k:figures.append(self))
+    plot_snapshot(tmp_path,'T1_01',sensor,cfg,tx,rx,txm,rxm,100,7,response['events'])
+    figure=figures[0]
+    assert '2048 Hz' in figure.axes[1].get_title()
+    labels=[t.get_text() for t in figure.axes[3].get_yticklabels()]
+    assert 'A — sent' in labels and 'A — received' in labels
+    lines=figure.axes[3].lines
+    for color in MARKER_COLORS[:3]:
+        segments=[line for line in lines if line.get_color()==color and len(line.get_xdata())==2]
+        assert {'-','--'}<={line.get_linestyle() for line in segments}
+        assert all(line.get_linewidth()>=2.5 for line in segments)

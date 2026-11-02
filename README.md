@@ -12,9 +12,13 @@ processing wait. View the recorded results first; analysis is a separate step.
 
 ## Test 1 — EEG only
 
-Nine sampling rates: **64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384 Hz**.
+Five sampling rates: **500, 750, 1000, 1500, 2048 Hz**.
 Each rate is tested with **16, 32, 64, 128 channels**, three repetitions per
-combination: **108 EEG recordings**.
+combination: **60 EEG recordings**.
+
+The sender transmits one sample at a time. Earlier tests grouped 16 samples:
+at 500 Hz this added up to 30 ms before sending, versus about 7 ms at 2048 Hz.
+That made the live view improve with rate even when every recorded value matched.
 
 The report starts with color maps: sampling rate across columns, channel count
 across rows. Maps show:
@@ -37,11 +41,34 @@ are deliberately simple. No automatic explanation is presented ahead of the data
 ## Test 2 — adding signals
 
 A separate report section shows **EEG → EEG + EMG → EEG + EMG + IMU**. Existing
-signals keep the same rates and channels. The default rates are EEG 512 Hz,
+signals keep the same rates and channels. The fixed rates are EEG 500 Hz,
 EMG 2000 Hz, and IMU 100 Hz. Three repetitions per stage give **nine recordings**.
 
 This section has its own maps, signal selection, marker measurements, and table.
 It is not pooled with the EEG matrix.
+
+In this test only, the same known event changes all simulated sensors. A separate
+plot shows its sent and received sample times together, then its actual read times.
+The table compares each sensor with EEG. It separates the difference already
+present at sending, due to native sampling times, from any added difference after
+reception. These generated streams share one sender clock; this does not measure
+clock offsets in independent physical devices.
+
+## Acquisition, reading, and display
+
+- **Acquisition rate:** new samples per second produced by each sensor.
+- **Receiver reading target:** **2048 cycles/s**, unchanged across all normal
+  tests. Each cycle pulls buffered samples from every stream, including
+  markers. A cycle can return zero, one, or several samples. No samples are
+  discarded to force every sensor to have the same rate.
+- **Display rate:** **2048 steps/s**, unchanged across normal plots. The live view
+  keeps the latest value until another value becomes available.
+
+The computer may miss a reading deadline. The report lists the measured reading
+rate and reading gaps rather than assuming the target was achieved. Reading
+faster does not create samples or improve the original sensor bandwidth. Nyquist
+applies to **acquisition**: sample above twice the highest signal frequency, with
+appropriate filtering. Reading frequency is a separate buffer and delay choice.
 
 ## Recorded time vectors
 
@@ -58,11 +85,15 @@ Each case archive contains these arrays:
 | `tx_<signal>__sender_send_time_s` | Time of the actual Python send call |
 | `rx_<signal>__sender_time_s` | Sender counter carried in the received packet |
 | `rx_<signal>__receiver_time_s` | Receiver's own read-clock counter |
+| `rx_<signal>__read_attempt_time_s` | Every buffer reading attempt, including empty reads |
 
 The first signal plot compares **all sample values**, using the sample counter
-carried with the data. The second shows **when values became available**, using
-the receiver's own clock. It shows the latest value at each read: samples in one
-batch share one measured read time. Individual arrival times are not invented.
+carried with the data. The second is explicitly a **live view**, not the full
+reconstruction: both signals are shown on the same fixed display clock, keeping
+the latest available value at each step. Reception availability uses the receiver's
+own measured read clock. A read may return multiple samples; they all remain in
+the recording even if the live view shows only the latest. Individual arrival
+times are not invented.
 The delay plot uses the two recorded counters directly and separates sample-to-read
 delay from send-call-to-read delay.
 
@@ -70,9 +101,12 @@ delay from send-call-to-read delay.
 
 Markers **A, B, C** cause configured changes in the sent EEG, normally **200 ms**
 later. The response is detected from the actual sent and received EEG values,
-not assumed from the schedule. EMG and IMU are not given artificial EEG responses.
+not assumed from the schedule. In Test 2, EMG and IMU also receive the known
+shared event, scaled to their own signal values, for the synchronization check.
 
-Plots show the sent marker/change pair and received marker/change pair. The table
+Plots use **one color per marker**, thick lines, and explicit sent/received rows.
+**Solid lines and filled symbols mean sent; dashed lines and hollow symbols mean
+received.** A circle marks the marker; a triangle marks the EEG change. The table
 lists their times and separates **stored timing** from **read-time timing**.
 Batching can affect the latter even when sample timestamps are preserved. Missing
 markers, lost response onsets, overlaps, and responses falling beyond recording
@@ -80,7 +114,7 @@ end are listed explicitly. These tests measure this simulated EEG/marker path.
 
 ## Running and output files
 
-The default run has **117 cases**, five seconds of signal each. Startup, clock
+The default run has **69 cases**, five seconds of signal each. Startup, clock
 measurement, saving, and plotting add time; the estimated total is printed before
 recording. The included example report is a short cloud functionality check,
 not the complete default run or a performance measurement of your PC.
@@ -98,7 +132,7 @@ There are four result files, without figure folders:
 | --- | --- |
 | `summary.html` | Standalone report, maps and selectable signal plots |
 | `metrics.csv` | Every case and signal measurement |
-| `markers.csv` | Every EEG marker/response measurement |
+| `markers.csv` | Marker responses and event timing between simultaneous sensors |
 | `recordings.zip` | Original arrays, time counters, plan, settings, and machine information |
 
 The ZIP contains one compressed NumPy recording per case; full signal arrays can
