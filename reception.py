@@ -39,6 +39,12 @@ def receive(cfg, run_id, directory):
     receiver_origin=None
     fixed_offset=next(c['offset'] for c in corrections if c['stream']!='markers')
     last_data=begin
+    period=1./cfg['receiver_poll_hz']
+    next_read=begin
+    read_attempts={name:[] for name in inlets if name!='markers'}
+    # Connecting an inlet is not enough: finish every clock measurement before
+    # allowing the sender to start acquisition.
+    save_json(out/'rx_ready.json',dict(run_id=run_id,ready=True))
     try:
         while local_clock() < deadline:
             now = local_clock()
@@ -55,6 +61,7 @@ def receive(cfg, run_id, directory):
                         pass  # retain the last valid real-time estimate
                 refresh = local_clock() + cfg['correction_interval']
             for name, inlet in inlets.items():
+                if name!='markers':read_attempts[name].append(local_clock())
                 samples, ts = inlet.pull_chunk(timeout=0., max_samples=4096)
                 arrival = local_clock()  # read completion, not a hardware/socket timestamp
                 if not ts:
@@ -88,7 +95,11 @@ def receive(cfg, run_id, directory):
                     all(inlet.samples_available()==0 for inlet in inlets.values())):
                 complete = True
                 break
-            time.sleep(.001)
+            # Keep one common cadence for every stream and every case. If the
+            # OS delays a cycle, skip missed deadlines rather than burst-read.
+            now=local_clock()
+            next_read=next_read+period*max(1,int((now-next_read)//period)+1)
+            time.sleep(max(0.,next_read-now))
     finally:
         for s in cfg['sensors']:
             st = states[s['name']]
@@ -96,6 +107,12 @@ def receive(cfg, run_id, directory):
             for k in ('ids', 'values', 'raw', 'corrected', 'arrival', 'correction','sender_time_s','receiver_time_s'):
                 arrays[k] = np.concatenate(st[k]) if st[k] else np.empty(
                     (0, s['channels']) if k == 'values' else (0,))
+            attempts=np.asarray(read_attempts[s['name']])
+            if receiver_origin is not None:
+                attempts=attempts-receiver_origin
+                attempts=attempts[(attempts>=0)&(attempts<wall_duration(cfg))]
+            else:attempts=np.empty(0)
+            arrays['read_attempt_time_s']=attempts
             np.savez_compressed(out / f'rx_{s["name"]}.npz', **arrays)
         for event in marker_log:
             event['receiver_time_s']=event['arrival']-receiver_origin if receiver_origin is not None else None

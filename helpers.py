@@ -8,8 +8,8 @@ import numpy as np
 
 def validate(config):
     cfg = json.loads(json.dumps(config))
-    defaults = dict(duration=10., chunk=16, inlet_buffer=60, correction_interval=2.,
-                    receiver_pause=0., pause_every=2., drift_ppm=0., start_delay=2., event_tolerance_ms=10.)
+    defaults = dict(duration=10., chunk=1, inlet_buffer=60, correction_interval=2.,
+                    receiver_pause=0., receiver_poll_hz=2048., pause_every=2., drift_ppm=0., start_delay=2., event_tolerance_ms=10.)
     for key, value in defaults.items():
         cfg.setdefault(key, value)
     if not cfg.get('sensors'):
@@ -45,7 +45,7 @@ def validate(config):
             raise ValueError('Acquisition rate would reach zero during the experiment')
     if len(set(names)) != len(names):
         raise ValueError('Sensor names must be unique')
-    for k in ('duration', 'inlet_buffer', 'correction_interval', 'pause_every', 'start_delay'):
+    for k in ('duration', 'inlet_buffer', 'correction_interval', 'receiver_poll_hz', 'pause_every', 'start_delay'):
         if not math.isfinite(cfg[k]) or cfg[k] <= 0:
             raise ValueError(f'{k} must be positive and finite')
     if int(cfg['inlet_buffer']) != cfg['inlet_buffer']:

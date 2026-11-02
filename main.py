@@ -77,6 +77,7 @@ def build_cases(settings):
             for sensor in cfg['sensors']:
                 sensor.pop('samples', None)
         cfg['experiment'], cfg['length_mode'] = experiment, mode
+        cfg['shared_sensor_events'] = experiment == 'streams'
         cases.append((experiment, name, validate(cfg)))
     for experiment in experiments:
         options = tests[experiment]
@@ -112,7 +113,7 @@ def make_plan(cases):
             length_mode=cfg['length_mode'],sensors=';'.join(s['name'] for s in cfg['sensors']),
             rates_hz=';'.join(str(s['rate']) for s in cfg['sensors']),channels=';'.join(str(s['channels']) for s in cfg['sensors']),
             samples=';'.join(str(sample_count(cfg,s)) for s in cfg['sensors']),chunk=cfg['chunk'],buffer_s=cfg['inlet_buffer'],
-            pause_s=cfg['receiver_pause'],acquisition_s=float(wall_duration(cfg)),estimate_low_s=low,estimate_high_s=high,
+            pause_s=cfg['receiver_pause'],receiver_poll_hz=cfg['receiver_poll_hz'],acquisition_s=float(wall_duration(cfg)),estimate_low_s=low,estimate_high_s=high,
             actual_s=None,error=''))
     return plan
 
@@ -172,9 +173,8 @@ def _collect_normal(case,cfg,report,rows,events):
     for sensor in cfg['sensors']:
         metrics=report['sensors'][sensor['name']]
         rows.append(case_result(case,cfg,sensor,metrics))
-        if sensor['kind'].upper()=='EEG':
-            for event in metrics.get('responses',{}).get('events',[]):
-                events.append(dict(case=case,test=1 if cfg['experiment']=='eeg' else 2,stream=sensor['name'],**event))
+    for event in report.get('stream_timing',[]):
+        events.append(dict(case=case,test=1 if cfg['experiment']=='eeg' else 2,**event))
 
 
 def _normal_views(root,work,plan,rows,events,assets,machine,finished=False):
@@ -205,6 +205,7 @@ def normal_experiment(config,output=None,plan_only=False):
     print(f'Test 1: {sum(p["test"]==1 for p in plan)} EEG cases. Test 2: {sum(p["test"]==2 for p in plan)} additional-signal cases.',flush=True)
     note='No added processing wait.' if all(c[2]['receiver_pause']==0 for c in cases) else 'An extra receiver pause is configured.'
     print(f'Estimated total: {low/60:.1f}–{high/60:.1f} minutes, including setup and recording. {note}',flush=True)
+    print('Receiver reading target: '+', '.join(f'{v:g} Hz' for v in sorted({c[2]['receiver_poll_hz'] for c in cases}))+'. Actual reading rates and gaps will be reported.',flush=True)
     if plan_only:
         for p in plan:print(f'{p["case"]}: {p["sensors"]}, {p["rates_hz"]} Hz, {p["channels"]} channels',flush=True)
         if output:
