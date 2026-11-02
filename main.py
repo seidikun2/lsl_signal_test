@@ -167,7 +167,22 @@ def main():
     parser.add_argument('--config',default=str(Path(__file__).with_name('config.json')))
     parser.add_argument('--out',help='Optional fresh output directory')
     parser.add_argument('--plan-only',action='store_true',help='Show and save the plan without transmitting')
+    parser.add_argument('--signals',action='store_true',help='Run the original signal/marker experiments instead of buffer stress tests')
+    parser.add_argument('--local',action='store_true',help='Long boundary, continuous recovery and incremental-stream experiments for the target machine')
+    parser.add_argument('--reanalyze',help='Regenerate the buffer report from a recordings.npz file without transmitting')
     args=parser.parse_args()
+    if args.local and (args.signals or args.reanalyze):
+        parser.error('--local cannot be combined with --signals or --reanalyze')
+    if args.reanalyze:
+        if args.signals or args.plan_only:
+            parser.error('--reanalyze cannot be combined with --signals or --plan-only')
+        from buffering import reanalyze
+        reanalyze(args.reanalyze, args.out)
+        return
+    if not args.signals:
+        from buffering import experiment
+        experiment(args.config, args.out, args.plan_only, local=args.local)
+        return
     cases=build_cases(read_settings(args.config))
     root=prepare_results(args.out or Path(__file__).with_name('results'))
     plan=make_plan(cases)

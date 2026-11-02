@@ -37,8 +37,10 @@ def interpolate_segments(times, values, ids, grid, rate):
     return result
 
 
-def delivery_hold(times, values, grid, ids):
+def delivery_hold(times, values, grid, ids, acquisition_times=None, max_age_s=None):
     """Latest available sample per Python read; do not invent within-chunk times."""
+    if max_age_s is not None and (not np.isfinite(max_age_s) or max_age_s<=0 or acquisition_times is None):
+        raise ValueError('A positive max_age_s requires acquisition timestamps')
     result = np.full((len(grid), values.shape[1]), np.nan)
     if not len(times):
         return result
@@ -55,25 +57,68 @@ def delivery_hold(times, values, grid, ids):
     t, y, last_ids = times[selected], values[selected], ids[selected]
     # If packets were reordered, the latest acquisition ID already available wins.
     newest = last_ids == np.maximum.accumulate(last_ids)
+    selected = selected[newest]
     t, y = t[newest], y[newest]
     j = np.searchsorted(t, grid+1e-9, side='right')-1
     valid = j >= 0
+    if max_age_s is not None:
+        ages = grid-np.asarray(acquisition_times)[selected][j.clip(0)]
+        valid &= (ages>=-1e-9) & (ages<=max_age_s)
     result[valid] = y[j[valid]]
     return result
 
 
-def temporal_reconstruction(tx, rx, rate, origin, anchor_offset):
+def buffered_playback(acquisition, values, arrival, ids, grid, rate, delay_s):
+    """Replay every sample on an explicit delayed clock, only after real arrival.
+
+    This is causal zero-order playback of the sampled signal, not an ideal
+    band-limited reconstruction. Late samples and missing indices make gaps.
+    """
+    if not np.isfinite(delay_s) or delay_s<0:
+        raise ValueError('Playback delay must be finite and nonnegative')
+    result=np.full((len(grid),values.shape[1]),np.nan)
+    latest=np.full(len(grid),-1,dtype=np.int64)
+    target=grid-delay_s
+    cuts=np.flatnonzero((np.diff(ids)!=1)|(np.diff(acquisition)<=0)|(np.diff(acquisition)>1.5/rate))+1
+    for positions in np.split(np.arange(len(ids)),cuts):
+        if not len(positions):
+            continue
+        stamps=acquisition[positions]
+        j=np.searchsorted(stamps,target+1e-9,side='right')-1
+        p=positions[j.clip(0)]
+        valid=(j>=0)&(target<stamps[-1]+1/rate-1e-9)&(arrival[p]<=grid+1e-9)&(ids[p]>=latest)
+        result[valid]=values[p[valid]]
+        latest[valid]=ids[p[valid]]
+    return result
+
+
+def temporal_reconstruction(tx, rx, rate, origin, anchor_offset, grid_rate=None, until=None, max_age_s=None, playback_delay_s=None):
     # A single clock-domain translation preserves all time-varying corrections.
     # Never subtract each series' first timestamp or align by correlation here.
     grid_start = float(tx['sample'][0]-origin)
     rx_origin = origin+anchor_offset
     end = max(float(tx['sample'][-1]-origin),
               float(rx['arrival'][-1]-rx_origin) if len(rx['arrival']) else grid_start)
-    grid = grid_start+np.arange(int(np.ceil((end-grid_start)*rate))+1)/rate
+    grid_rate = rate if grid_rate is None else grid_rate
+    if not np.isfinite(grid_rate) or grid_rate<=0:
+        raise ValueError('Reconstruction grid rate must be positive and finite')
+    if until is not None:
+        if not np.isfinite(until) or until<grid_start:
+            raise ValueError('Reconstruction end must be finite and at or after its start')
+        end = until
+        steps = int(np.floor((end-grid_start)*grid_rate+1e-9))
+    else:
+        steps = int(np.ceil((end-grid_start)*grid_rate))
+    grid = grid_start+np.arange(steps+1)/grid_rate
     reference = interpolate_segments(tx['sample']-origin, tx['values'], tx['ids'], grid, rate)
     acquisition = interpolate_segments(rx['corrected']-rx_origin, rx['values'], rx['ids'], grid, rate)
     delivery = delivery_hold(rx['arrival']-rx_origin, rx['values'], grid, rx['ids'])
-    generated = delivery_hold(tx['generated']-origin, tx['values'], grid, tx['ids'])
+    fresh = delivery_hold(rx['arrival']-rx_origin, rx['values'], grid, rx['ids'],
+                          rx['corrected']-rx_origin, max_age_s) if max_age_s is not None else delivery
+    generated = (delivery_hold(tx['generated']-origin, tx['values'], grid, tx['ids'])
+                 if 'generated' in tx else np.full_like(reference,np.nan))
+    playback=(buffered_playback(rx['corrected']-rx_origin,rx['values'],rx['arrival']-rx_origin,
+                               rx['ids'],grid,rate,playback_delay_s) if playback_delay_s is not None else None)
     metrics = {}
     for name, values in [('acquisition', acquisition), ('delivery', delivery)]:
         mask = np.isfinite(reference).all(axis=1) & np.isfinite(values).all(axis=1)
@@ -83,7 +128,7 @@ def temporal_reconstruction(tx, rx, rate, origin, anchor_offset):
             rmse=float(np.sqrt(np.mean(errors**2))) if errors.size else None,
             rmse_per_channel=np.sqrt(np.mean(errors**2, axis=0)).tolist() if errors.size else [])
     return dict(time=grid, tx=reference, generated=generated,
-                rx_acquisition=acquisition, rx_delivery=delivery), metrics
+                rx_acquisition=acquisition, rx_delivery=delivery, rx_fresh=fresh, rx_playback=playback), metrics
 
 
 def windows(elapsed, latency, timing, width=2.):
@@ -247,21 +292,22 @@ def plot_snapshot(out, case, sensor, cfg, tx, rx, markers_tx, markers_rx, origin
     channels=[c for c in cfg.get('plot_channels',[0,1]) if c<sensor['channels']][:2] or [0]
     window=cfg.get('snapshot_seconds',2.)
     fig,axes=plt.subplots(len(channels)+1,1,figsize=(13,3*len(channels)+2),constrained_layout=True)
-    tx_time=tx['sample']-origin
-    rx_time=rx['corrected']-origin-offset
-    read_time=rx['arrival']-origin-offset
+    # Only selected channels and a short window use the dense display grid.
+    # Full-channel integrity/timing metrics retain the original acquisition rate.
+    tx_view={**tx,'values':tx['values'][:,channels]}
+    rx_view={**rx,'values':rx['values'][:,channels]}
+    reconstructed,_=temporal_reconstruction(tx_view,rx_view,sensor['rate'],origin,offset,
+        grid_rate=cfg.get('reconstruction_rate_hz',16384),until=window,
+        max_age_s=cfg.get('delivery_max_age_s',.25),playback_delay_s=cfg.get('playback_delay_s',.25))
     colors={m['label']:plt.get_cmap('tab10')(i) for i,m in enumerate(cfg['markers'])}
-    for ax,channel in zip(axes[:-1],channels):
-        source=(tx_time>=0)&(tx_time<=window)
-        acquisition=(rx_time>=0)&(rx_time<=window)
-        delivery=(read_time>=0)&(read_time<=window)
-        values=rx['values'][:,channel].astype(float).copy()
-        values[np.r_[False,np.diff(rx['ids'])!=1]]=np.nan
-        ax.plot(tx_time[source],tx['values'][source,channel],label='Transmitted',lw=1.2)
-        ax.plot(rx_time[acquisition],values[acquisition],'--',label='Received: acquisition timestamps',lw=1)
-        positions=np.flatnonzero(delivery)
-        positions=positions[::max(1,len(positions)//1500)]
-        ax.scatter(read_time[positions],rx['values'][positions,channel],s=5,alpha=.45,label='Received: read timestamps')
+    for view_channel,(ax,channel) in enumerate(zip(axes[:-1],channels)):
+        grid=reconstructed['time']
+        ax.plot(grid,reconstructed['tx'][:,view_channel],label='TX: acquisition time',lw=1.1)
+        ax.plot(grid,reconstructed['rx_acquisition'][:,view_channel],'--',label='RX: acquisition time (offline)',lw=.9)
+        ax.step(grid,reconstructed['rx_delivery'][:,view_channel],where='post',color='.65',lw=.8,label='Last delivered value (may be stale)')
+        ax.step(grid,reconstructed['rx_fresh'][:,view_channel],where='post',color='tab:green',lw=1,label='Available now: within age limit')
+        ax.step(grid,reconstructed['rx_playback'][:,view_channel],where='post',color='tab:purple',lw=.9,
+                label=f'All samples: playback delayed {cfg.get("playback_delay_s",.25):g}s')
         for event in markers_tx:
             if event['kind']!='stimulus': continue
             t=event['sample_time']-origin
@@ -281,7 +327,7 @@ def plot_snapshot(out, case, sensor, cfg, tx, rx, markers_tx, markers_rx, origin
     axes[-1].set(xlabel='Time from common origin (s)',ylabel='Read latency (ms)',title='Full recording: acquisition-to-read delay')
     axes[-1].grid(alpha=.2)
     fig.suptitle(f'{case} / {sensor["name"]}: {sensor["rate"]:g} Hz, {sensor["channels"]} channels\n'
-                 'Solid marker = TX; dashed = RX read; dotted = expected response. No time realignment.')
+                 'Steps update only after a read; gray = last value, green = fresh. No time realignment.')
     fig.savefig(Path(out)/f'{case}_{sensor["name"]}_snapshot.png',dpi=120)
     plt.close(fig)
 

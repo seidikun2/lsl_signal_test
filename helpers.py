@@ -28,6 +28,10 @@ def validate(config):
         if int(s['channels']) != s['channels']:
             raise ValueError('channels must be an integer')
         s['channels'] = int(s['channels'])
+        if 'bandwidth_hz' in s:
+            bandwidth = s['bandwidth_hz']
+            if not math.isfinite(bandwidth) or bandwidth<=0 or s['rate']<=2*bandwidth:
+                raise ValueError('Nyquist requires rate > 2 * positive bandwidth_hz; use an anti-alias filter')
         if 'samples' in s and (not isinstance(s['samples'], int) or s['samples'] < 1):
             raise ValueError('samples must be a positive integer')
         s.setdefault('drift_ppm', cfg['drift_ppm'])
@@ -56,6 +60,11 @@ def validate(config):
         raise ValueError('event_tolerance_ms must be positive')
     if not math.isfinite(cfg.get('snapshot_seconds',2)) or cfg.get('snapshot_seconds',2) <= 0:
         raise ValueError('snapshot_seconds must be positive')
+    for key in ('reconstruction_rate_hz','delivery_max_age_s'):
+        if key in cfg and (not math.isfinite(cfg[key]) or cfg[key]<=0):
+            raise ValueError(f'{key} must be positive and finite')
+    if 'playback_delay_s' in cfg and (not math.isfinite(cfg['playback_delay_s']) or cfg['playback_delay_s']<0):
+        raise ValueError('playback_delay_s must be finite and nonnegative')
     channels = cfg.get('plot_channels',[0,1])
     if not isinstance(channels,list) or not 1<=len(channels)<=2 or any(not isinstance(c,int) or c<0 for c in channels):
         raise ValueError('plot_channels must contain one or two nonnegative channel indices')
