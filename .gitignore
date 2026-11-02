@@ -14,3 +14,4 @@ results/*.npz
 results/*.zip
 recordings.zip
 recordings.npz
+/results-real*/

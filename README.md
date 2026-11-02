@@ -12,9 +12,10 @@ processing wait. View the recorded results first; analysis is a separate step.
 
 ## Test 1 — EEG only
 
-Five sampling rates: **500, 750, 1000, 1500, 2048 Hz**.
+Six sampling rates: **500, 512, 731.5, 1000, 1500, 2048 Hz**.
 Each rate is tested with **16, 32, 64, 128 channels**, three repetitions per
-combination: **60 EEG recordings**.
+combination: **72 EEG recordings**. Rates are not restricted to integer multiples;
+731.5 Hz also exercises a genuinely decimal sampling rate.
 
 The sender transmits one sample at a time. Earlier tests grouped 16 samples:
 at 500 Hz this added up to 30 ms before sending, versus about 7 ms at 2048 Hz.
@@ -41,8 +42,8 @@ are deliberately simple. No automatic explanation is presented ahead of the data
 ## Test 2 — adding signals
 
 A separate report section shows **EEG → EEG + EMG → EEG + EMG + IMU**. Existing
-signals keep the same rates and channels. The fixed rates are EEG 500 Hz,
-EMG 2000 Hz, and IMU 100 Hz. Three repetitions per stage give **nine recordings**.
+signals keep the same rates and channels. The fixed rates are EEG **512 Hz**,
+EMG **2000 Hz**, and IMU **70 Hz**. Three repetitions per stage give **nine recordings**.
 
 This section has its own maps, signal selection, marker measurements, and table.
 It is not pooled with the EEG matrix.
@@ -53,6 +54,13 @@ The table compares each sensor with EEG. It separates the difference already
 present at sending, due to native sampling times, from any added difference after
 reception. These generated streams share one sender clock; this does not measure
 clock offsets in independent physical devices.
+
+Unrelated rates do not inherently cause accumulating delay. Samples simply fall
+at different instants: 512 Hz gives about 1.95 ms per sample, while 70 Hz gives
+about 14.29 ms. A common event can therefore appear in different first samples.
+The table shows this difference at sending, separately from any added difference
+after reception. The buffer holds pending samples; timestamps and clock mapping
+preserve their positions in time. Decimal sensor rates are accepted as well.
 
 ## Acquisition, reading, and display
 
@@ -114,7 +122,7 @@ end are listed explicitly. These tests measure this simulated EEG/marker path.
 
 ## Running and output files
 
-The default run has **69 cases**, five seconds of signal each. Startup, clock
+The default run has **81 cases**, five seconds of signal each. Startup, clock
 measurement, saving, and plotting add time; the estimated total is printed before
 recording. The included example report is a short cloud functionality check,
 not the complete default run or a performance measurement of your PC.
@@ -143,6 +151,84 @@ Previous default results are preserved outside the project in
 `--plan-only` does not replace existing results. `--signals` selects the same normal
 EEG/marker workflow explicitly. Single older recordings can still be reanalyzed
 with `python analysis.py path/to/T1_01_recording.npz`.
+
+## Test 3 — real ANT Neuro eego mylab, separately
+
+This mode receives the existing device outlet. It does not generate EEG, add
+sample-counter channels, resample, filter, or change the amplifier rate. It uses
+the stream's actual channel count and keeps every channel, including auxiliaries.
+The configured name is **`EE225-020034-000905_on_DESKTOP-U197OKE`**, from the
+working receiver example. Keep using the same VS Code Python interpreter.
+
+1. Start the eego LSL outlet. Start the PsychoPy marker outlet if needed.
+2. In **LabRecorder**, select the **same EEG and marker outlets** and start an XDF
+   recording before starting Python. Keep both receivers running together.
+3. Run the Python capture in the VS Code terminal:
+
+   ```bash
+   python main.py --list-streams
+   python main.py --real-eeg
+   ```
+
+   The default capture lasts **60 seconds**. Ctrl+C saves a shorter recording.
+   To select a marker outlet explicitly, use its exact name:
+
+   ```bash
+   python main.py --real-eeg --marker-name PsychoPyMarkers --duration 60
+   ```
+
+4. Stop LabRecorder after Python finishes and let it close the XDF file.
+5. Install the optional XDF reader in that same interpreter, then compare:
+
+   ```bash
+   python -m pip install pyxdf
+   python main.py --compare-eeg results-real/recordings.npz --reference /path/to/session.xdf
+   ```
+
+Open **`results-real/summary.html`**. The report first shows the actual EEG,
+received markers, read delays and the age of the last EEG sample at capture stop.
+The reference section adds an overlay and a
+channel map of value differences, counts unmatched samples in the shared time
+range, and checks marker values and original timestamps. Zero value difference
+means the matched values agree. Missing timestamps, nonfinite values, channel
+order changes and missing marker streams remain visible; they are not replaced
+with successful zero measurements.
+
+The XDF reader explicitly disables clock adjustment and timestamp smoothing for
+this comparison. Both receivers must consume the same outlet at the same time:
+matching uses the original source timestamps within **1 microsecond**, with no
+curve alignment, interpolation or value scaling. Samples outside the common
+recording range are excluded from the loss comparison. Available channel labels
+and units are checked before comparing; otherwise original channel order is used
+and the missing label check is stated. A changed marker value is reported even
+when its timestamp matches. Repeated markers are preserved individually.
+
+Raw timestamps, corrected timestamps, read times, clock estimates and outlet
+metadata are saved in **`recordings.npz`**. The other three files are
+**`summary.html`**, **`metrics.csv`**, and **`markers.csv`**. Comparison does not
+modify the raw NPZ. This folder stays local and separate from synthetic results.
+For another capture, use a fresh directory such as `--out results-real-02`.
+Names, duration and buffer settings are in `config.json` under `real_eeg`.
+
+With `marker_name` empty, Python looks for one outlet of type `Markers`; if none
+is found it records EEG alone and says so. Multiple candidates require an exact
+`--marker-name`. Marker recording must also be enabled in LabRecorder. A minimal
+PsychoPy pattern is:
+
+```python
+from pylsl import StreamInfo, StreamOutlet
+markers = StreamOutlet(StreamInfo('PsychoPyMarkers', 'Markers', 1, 0,
+                                  'string', 'psychopy-markers'))
+# In the experiment, where win is the PsychoPy window:
+win.callOnFlip(markers.push_sample, ['A'])
+win.flip()
+```
+
+The software marker is emitted at the flip callback; it is not a measured physical
+screen-onset timestamp. No artificial marker-triggered response is injected into
+real EEG. Recording the same LSL stream twice checks its transport and storage;
+physical EEG/stimulus synchronization needs a recorded trigger or sensor. The
+hardware path must be checked on the acquisition PC; cloud checks use test outlets.
 
 ## Extra tests — only after looking at normal results
 

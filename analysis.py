@@ -592,7 +592,7 @@ def write_results_report(root,plan,rows,events,assets,maps,machine):
             parts.append('<h3>Synchronization between sensors</h3>')
             sync_cases=[p['case'] for p in scheduled if p['case']+'_sync' in assets]
             if sync_cases:
-                parts.append('<p>The same known event changes every simulated sensor. The first chart compares sample times for analysis; the second compares actual read times. Different acquisition rates can place the first changed sample slightly apart. The table separates that original difference from any added timing difference.</p>')
+                parts.append('<p>The same known event changes every simulated sensor. Rates do not need to be integer multiples. The first chart compares sample times for analysis; the second compares actual read times. Each sensor samples at its own instants, so the first changed samples can be slightly apart. The table separates that original difference from any added timing difference. The buffer holds waiting samples; it does not align clocks.</p>')
                 options=''.join('<option value="'+esc(case+'_sync')+'">'+esc(case)+'</option>' for case in sync_cases)
                 parts.append('<label>Simultaneous recording <select data-gallery="stream-sync">'+options+'</select></label><img id="stream-sync" alt="Same observed event in all sensors, before and after transmission">')
                 timing=[e for e in events if e['test']==2 and e['stream']!=e.get('reference_stream')]
