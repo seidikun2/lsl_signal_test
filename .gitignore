@@ -10,3 +10,4 @@ runs/
 reuns/
 tests/
 results/**/*.npz
+results/*.npz

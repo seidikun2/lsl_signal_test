@@ -11,7 +11,8 @@ from helpers import save_json, sample_elapsed, wall_duration, sample_count, mark
 def signal(kind, indices, rate, channels, events=(), elapsed=None):
     t = np.asarray(indices, dtype=float)[:, None] / rate
     c = np.arange(channels)[None, :]
-    # Frequencies remain below Nyquist, even in the 100-Hz sweep.
+    # Base oscillations stay below Nyquist in the documented sweeps.
+    # Ideal rectangular stimulus pulses are not band-limited analog waveforms.
     if kind.upper() == 'EEG':
         y = 20*np.sin(2*np.pi*(8 + c % 5)*t + .17*c)
         y += 8*np.sin(2*np.pi*min(22., .35*rate)*t + .11*c)

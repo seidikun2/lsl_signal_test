@@ -71,9 +71,9 @@ def test_two_experiment_plan_and_fixed_stream_parameters():
     cases = build_cases(settings)
     eeg = [cfg for experiment, _, cfg in cases if experiment == 'eeg']
     streams = [cfg for experiment, _, cfg in cases if experiment == 'streams']
-    assert len(eeg) == 20 and len(streams) == 3
+    assert len(eeg) == 36 and len(streams) == 3
     assert {(c['sensors'][0]['rate'], c['sensors'][0]['channels']) for c in eeg} == {
-        (rate, channels) for rate in [128,256,512,1024,2048] for channels in [16,32,64,128]}
+        (rate, channels) for rate in [64,128,256,512,1024,2048,4096,8192,16384] for channels in [16,32,64,128]}
     assert [len(c['sensors']) for c in streams] == [1,2,3]
     assert streams[0]['sensors'][0] == streams[1]['sensors'][0] == streams[2]['sensors'][0]
     assert streams[1]['sensors'][1] == streams[2]['sensors'][1]
@@ -347,13 +347,373 @@ def test_recording_roundtrip_preserves_own_timestamps(tmp_path):
 def test_startup_plan_lists_all_cases_without_transmitting(tmp_path):
     import subprocess,sys,csv
     output=tmp_path/'results'
-    process=subprocess.run([sys.executable,str(Path(__file__).with_name('main.py')),'--plan-only','--out',str(output)],
+    process=subprocess.run([sys.executable,str(Path(__file__).with_name('main.py')),'--signals','--plan-only','--out',str(output)],
                            cwd=Path(__file__).parent,capture_output=True,text=True,timeout=30)
     assert process.returncode==0,process.stderr
     plan=list(csv.DictReader((output/'plan.csv').open()))
-    assert len(plan)==23 and all(p['status']=='planned' for p in plan)
+    assert len(plan)==39 and all(p['status']=='planned' for p in plan)
     assert all(float(p['estimate_low_s'])>=float(p['acquisition_s']) for p in plan)
     assert all(float(p['estimate_high_s'])>float(p['estimate_low_s']) for p in plan)
-    assert 'T1_20' in process.stdout and 'T2_03' in process.stdout
+    assert 'T1_36' in process.stdout and 'T2_03' in process.stdout
     assert (output/'plan.png').is_file() and (output/'summary.html').is_file()
     assert not list(output.rglob('*recording.npz'))
+
+
+# Queue overload checks use whole executions and actual queue telemetry, not clock drift.
+from buffering import build_plan as buffer_plan, fit_windows, summarize as buffer_summary, statistics, sign_test
+
+
+def buffer_fixture(slow=False, missing=0, drained=True):
+    rate = 100
+    total = 400
+    ids = np.arange(total-missing)
+    sample = 10+np.arange(total)/rate
+    read = sample[ids]+(.05+.5*ids/rate if slow else .2)
+    processed = read+.03
+    times = np.arange(.2, 4.2, .1)
+    queue = times*50 if slow else np.full(len(times),20.)
+    trace = dict(start=np.array(10.), ids=ids, values=signal('EEG',ids,rate,2),
+                 raw=sample[ids], read=read, processed=processed, correction=np.array(0.),
+                 sent=sample+.02, sample=sample, drained=np.array(drained), remaining=np.array(0 if drained else missing),
+                 batches=np.column_stack((10+times,10+times+.03,queue,queue,np.full(len(times),10))))
+    case = dict(case='B1', axis='load',value=1.5 if slow else .25,repeat=1,
+                rate_hz=rate,channels=2,tx_chunk=10,read_chunk=10,buffer_s=8,duration_s=4,
+                processing_s_per_sample=.003,load=.3,expected=total)
+    return case, trace
+
+
+def test_constant_large_delay_is_not_accumulating_backlog():
+    case, trace = buffer_fixture()
+    row = buffer_summary(case,trace,.5)
+    assert row['total_p99_ms'] == pytest.approx(230)
+    assert row['queue_slope_ms_s'] == pytest.approx(0,abs=1e-8)
+    assert row['added_delay_ms'] == pytest.approx(0,abs=1e-8)
+    assert row['state'] == 'no sustained growth'
+    assert row['batch_p50_ms']+row['after_send_p50_ms']+row['processing_p50_ms'] == pytest.approx(230)
+
+
+def test_growing_actual_queue_and_completion_delay_are_detected():
+    case, trace = buffer_fixture(slow=True)
+    row = buffer_summary(case,trace,.5)
+    assert row['state'] == 'growing queue'
+    assert row['queue_slope_ms_s'] > 400
+    assert row['added_delay_ms'] > 500
+    assert row['lost'] == row['rmse'] == 0
+
+
+def test_unprocessed_tail_at_observation_limit_is_not_labeled_lost():
+    case, trace = buffer_fixture(slow=True,missing=100,drained=False)
+    row = buffer_summary(case,trace,.5)
+    assert row['missing'] == row['remaining'] == 100
+    assert row['lost'] is None
+    assert row['state'] == 'observation limit'
+
+
+def test_saturated_flat_queue_with_drops_is_not_reported_as_success():
+    case, trace = buffer_fixture(missing=80)
+    row = buffer_summary(case,trace,.5)
+    assert row['lost'] == 80
+    assert row['state'] == 'data loss observed'
+
+
+def test_drain_phase_cannot_create_a_false_production_trend():
+    times = np.arange(0,8,.05)
+    queue = np.where(times<4,100,100+1000*(times-4))
+    slope, growth, windows = fit_windows(times,queue,4,.5)
+    assert slope == pytest.approx(0,abs=1e-8)
+    assert growth == pytest.approx(0)
+    assert np.max(windows[:,0])<4
+    assert fit_windows(times[:5],queue[:5],4,.5)[0] is None
+
+
+def test_statistical_unit_is_run_pair_and_incomplete_pairs_are_excluded():
+    rows=[]
+    for rep in range(1,7):
+        for slow,value in [(False,.25),(True,1.5)]:
+            case,trace=buffer_fixture(slow=slow)
+            row=buffer_summary(case,trace,.5)
+            row.update(repeat=rep,value=value)
+            rows.append(row)
+    groups, primary=statistics(rows)
+    assert primary['pairs']==6
+    assert primary['p']==pytest.approx(.03125)
+    assert primary['effect'][1]>0
+    assert all(g['n']==6 for g in groups)
+    rows[-1]['error']='receiver failed'
+    assert statistics(rows)[1]['pairs']==5
+    assert sign_test([0,0])==(1.,0)
+
+
+def test_buffer_plan_varies_one_axis_and_is_reproducibly_randomized():
+    cfg=dict(duration_s=4, repeats=6, extra_repeats=3, rate_hz=512, channels=32,
+             tx_chunk=16, read_chunk=32, buffer_s=8, loads=[.25,.6,.9,1.05,1.5,3],
+             buffers_s=[1,2], rates_hz=[64,256,1024,4096,16384], tx_chunks=[1,128,512],
+             rate_sweep_processing_s_per_sample=1/1024, max_drain_s=8, window_s=.5, seed=7301)
+    plan=buffer_plan(cfg)
+    assert plan==buffer_plan(cfg)
+    assert len(plan)==66
+    rates=[r for r in plan if r['axis']=='rate']
+    assert len({r['processing_s_per_sample'] for r in rates})==1
+    assert {r['rate_hz'] for r in rates}=={64,256,1024,4096,16384}
+    loads=[r for r in plan if r['axis']=='load']
+    assert len({(r['rate_hz'],r['buffer_s'],r['tx_chunk']) for r in loads})==1
+    with pytest.raises(ValueError):
+        buffer_plan(dict(cfg,read_chunk=0))
+
+
+def test_reanalysis_uses_embedded_metadata_without_transmission(tmp_path,monkeypatch):
+    import json
+    import buffering
+    case,trace=buffer_fixture()
+    row=buffer_summary(case,trace,.5)
+    row['state']='sem crescimento sustentado' # older recordings remain readable
+    saved=dict(config_json=np.array(json.dumps({'saved_duration':4})),
+               metrics_json=np.array(json.dumps([row])))
+    saved.update({'B1__'+key:value for key,value in trace.items() if key!='values'})
+    recording=tmp_path/'recordings.npz'
+    np.savez_compressed(recording,**saved)
+    def fail_if_transmitting(*args):
+        raise AssertionError('Reanalysis must not acquire new data')
+    monkeypatch.setattr(buffering,'record',fail_if_transmitting)
+    def inspect_report(root,rows,traces,cfg):
+        assert cfg=={'saved_duration':4}
+        assert rows[0]['state']=='no sustained growth'
+        assert rows[0]['total_p99_ms']==pytest.approx(230)
+        np.testing.assert_array_equal(traces['B1']['raw'],trace['raw'])
+        (root/'summary.html').write_text('report from saved data')
+        return [],{},'saved data verified'
+    monkeypatch.setattr(buffering,'report',inspect_report)
+    output=tmp_path/'reanalysis'
+    buffering.reanalyze(recording,output)
+    assert {p.name for p in output.iterdir()}=={'recordings.npz','metrics.csv','timeline.csv','summary.html'}
+
+
+def local_document():
+    import json
+    document=json.loads(Path(__file__).with_name('config.json').read_text())
+    document['local_tests'].update(duration_s=4,repeats=2,loads=[.8,1.05],window_s=.5)
+    document['local_tests'].update(rates_hz=[],stream_eeg_rates_hz=[])
+    document['local_tests']['recovery'].update(baseline_s=2,overload_s=4,recovery_s=6,sustain_s=1)
+    return document
+
+
+def test_local_protocol_preserves_existing_sensors_and_has_shared_consumer_cost():
+    from buffering import local_plan
+    doc=local_document()
+    cfg,plan=local_plan(doc)
+    assert len(plan)==12
+    for rep in (1,2):
+        stages=sorted([r for r in plan if r['axis']=='streams' and r['repeat']==rep],key=lambda r:r['value'])
+        assert [len(r['sensors']) for r in stages]==[1,2,3]
+        assert stages[0]['sensors']==stages[1]['sensors'][:1]==stages[2]['sensors'][:1]
+        assert stages[1]['sensors']==stages[2]['sensors'][:2]
+        assert stages[2]['sensors']==doc['acquisition']['sensors']
+        assert len({r['processing_s_per_sample'] for r in stages})==1
+    assert cfg['profile']=='local'
+
+
+def test_processing_overload_is_removed_by_wall_time_while_transmission_continues():
+    from buffering import processing_cost
+    case=dict(rate_hz=100,processing_s_per_sample=.006,recovery=dict(baseline_s=10,overload_s=10,baseline_load=.6,overload_load=1.5))
+    assert processing_cost(case,9.9)==pytest.approx(.006)
+    assert processing_cost(case,10)==pytest.approx(.015)
+    assert processing_cost(case,19.9)==pytest.approx(.015)
+    assert processing_cost(case,20)==pytest.approx(.006)
+
+
+def test_recovery_requires_sustained_queue_and_delay_normalization_before_tx_stops():
+    from buffering import recovery_metrics
+    cfg=dict(baseline_s=10,overload_s=10,recovery_s=20,baseline_load=.6,overload_load=1.5,tolerance_ms=50,sustain_s=2)
+    case=dict(duration_s=40,recovery=cfg)
+    stamps=np.arange(1.5,46,1)
+    q=np.where(stamps<10,0,np.where(stamps<20,(stamps-10)*200,np.maximum(0,2000-(stamps-20)*400)))
+    trace=dict(queue_windows=np.column_stack((stamps,q)),delay_windows=np.column_stack((stamps,q+50)))
+    result=recovery_metrics(case,trace,1)
+    assert result['recovered']
+    assert result['recovery_s']==5
+    assert result['recovery_confirmed_s']==7
+    trace['delay_windows'][:,1]=np.where(stamps<10,50,np.where(stamps<40,500,50))
+    assert recovery_metrics(case,trace,1)['recovered'] is False
+    trace['queue_windows'][:,1]=0
+    trace['delay_windows'][:,1]=50
+    result=recovery_metrics(case,trace,1)
+    assert not result['overload_observed'] and not result['recovered']
+
+
+def test_correlated_streams_are_not_pooled_as_independent_repetitions():
+    rows=[]
+    for rep in range(1,7):
+        for stream in ('eeg','emg'):
+            case,trace=buffer_fixture()
+            row=buffer_summary(case,trace,.5)
+            row.update(axis='streams',value=2,stream=stream,run_case=f'L{rep}',repeat=rep)
+            rows.append(row)
+    groups,primary=statistics(rows)
+    assert len(groups)==2 and all(g['n']==6 for g in groups)
+    assert primary['pairs']==0 and primary['p'] is None
+
+
+def test_default_local_plan_preview_never_replaces_existing_results(tmp_path):
+    import json
+    from buffering import experiment
+    doc=local_document()
+    doc['active_suite']='local'
+    config=tmp_path/'config.json'
+    config.write_text(json.dumps(doc))
+    out=tmp_path/'existing'
+    out.mkdir()
+    sentinel=out/'prior.txt'
+    sentinel.write_text('preserve me')
+    with pytest.raises(ValueError,match='empty'):
+        experiment(config,out,plan_only=True)
+    assert sentinel.read_text()=='preserve me'
+
+
+def test_common_grid_preserves_native_rates_and_batch_causality():
+    from analysis import temporal_reconstruction
+    grids=[]
+    for rate in (100,2000,16384):
+        ids=np.arange(int(rate*.2)+1)
+        times=10+ids/rate
+        values=np.sin(2*np.pi*8*ids/rate)[:,None]
+        # Every packet becomes available only when its last sample is read.
+        reads=10+.02*(ids//max(1,int(rate*.02))+1)
+        tx=dict(ids=ids,sample=times,values=values)
+        rx=dict(ids=ids,corrected=times,arrival=reads,values=values)
+        rec,_=temporal_reconstruction(tx,rx,rate,10,0,grid_rate=16384,until=.2,max_age_s=.1)
+        grids.append(rec['time'])
+        assert np.isnan(rec['rx_delivery'][rec['time']<.02]).all()
+        between=(rec['time']>=.0201)&(rec['time']<.0399)
+        assert np.ptp(rec['rx_delivery'][between,0])==0
+        assert np.unique(times).size==len(times) # acquisition timestamps stay distinct
+    np.testing.assert_array_equal(grids[0],grids[1])
+    np.testing.assert_array_equal(grids[1],grids[2])
+    assert np.diff(grids[0])==pytest.approx(1/16384)
+
+
+def test_freshness_uses_acquisition_age_not_time_since_the_read():
+    from analysis import delivery_hold
+    grid=np.array([1.999,2.,2.1])
+    received=delivery_hold(np.array([2.]),np.array([[7.]]),grid,np.array([0]),
+                          acquisition_times=np.array([0.]),max_age_s=.25)
+    assert np.isnan(received).all() # just delivered, but already two seconds old
+    with pytest.raises(ValueError,match='acquisition timestamps'):
+        delivery_hold(np.array([2.]),np.array([[7.]]),grid,np.array([0]),max_age_s=.25)
+
+
+def test_declared_bandwidth_rejects_aliasing_without_using_display_grid_as_acquisition():
+    sensor=dict(name='eeg',kind='EEG',rate=100,channels=2,bandwidth_hz=60)
+    with pytest.raises(ValueError,match='Nyquist'):
+        validate(dict(sensors=[sensor],reconstruction_rate_hz=16384))
+    sensor['rate']=256
+    assert validate(dict(sensors=[sensor]))['sensors'][0]['rate']==256
+
+
+def test_local_extreme_sweep_includes_16384_with_and_without_other_streams():
+    from buffering import local_plan
+    doc=local_document()
+    doc['local_tests'].update(rates_hz=[64,16384],stream_eeg_rates_hz=[512,16384],rate_repeats=2)
+    cfg,plan=local_plan(doc)
+    assert len(plan)==20
+    native=[r for r in plan if r['axis']=='rate_native']
+    assert {r['rate_hz'] for r in native}=={64,16384}
+    assert all(r['processing_s_per_sample']==0 for r in native)
+    mixed=[r for r in plan if r['axis']=='streams_rate']
+    for r in mixed:
+        assert r['sensors'][0]['rate']==r['value']
+        assert r['sensors'][1:]==doc['acquisition']['sensors'][1:]
+    assert cfg['reconstruction_rate_hz']==16384
+
+
+def test_short_preview_preserves_measured_corruption_and_drops_full_waveform():
+    from buffering import retain_preview,waveform_preview
+    case,trace=buffer_fixture()
+    trace['values'][10,0]+=123 # preserve a measured value, never regenerate RX
+    value=float(trace['values'][10,0])
+    retain_preview(case,trace,.5)
+    assert 'values' not in trace
+    assert trace['preview_values'][10,0]==pytest.approx(value)
+    assert trace['preview_positions'].max()<=51
+    rec=waveform_preview(case,trace,dict(snapshot_seconds=.5,reconstruction_rate_hz=100,delivery_max_age_s=.25))
+    assert rec['rx_acquisition'][10,0]==pytest.approx(value)
+
+
+def test_buffered_playback_replays_every_sample_instead_of_only_batch_latest():
+    from analysis import buffered_playback,delivery_hold
+    ids=np.arange(10)
+    acquired=ids/100
+    arrival=np.repeat([.04,.09],5)
+    values=ids[:,None].astype(float)
+    grid=np.arange(20)/100
+    replay=buffered_playback(acquired,values,arrival,ids,grid,100,.05)
+    np.testing.assert_array_equal(replay[5:15,0],ids)
+    assert np.isnan(replay[:5]).all()
+    latest=delivery_hold(arrival,values,grid,ids)
+    assert set(latest[np.isfinite(latest)])=={4.,9.}
+
+
+def test_buffered_playback_does_not_use_future_arrivals_or_fill_lost_samples():
+    from analysis import buffered_playback
+    ids=np.array([0,1,3,4])
+    acquired=ids/100
+    values=ids[:,None].astype(float)
+    grid=np.arange(20)/100
+    replay=buffered_playback(acquired,values,np.full(4,.04),ids,grid,100,.05)
+    assert np.isnan(replay[7,0]) # target .02 was lost
+    assert replay[8,0]==3
+    late=buffered_playback(acquired,values,np.full(4,.10),ids,grid,100,.05)
+    assert np.isnan(late).all() # entire packet missed its playback deadline
+    with pytest.raises(ValueError,match='delay'):
+        buffered_playback(acquired,values,np.full(4,.04),ids,grid,100,-1)
+
+
+def test_buffered_playback_does_not_silently_remove_the_configured_delay():
+    from analysis import buffered_playback
+    ids=np.arange(100)
+    times=ids/100
+    values=np.sin(2*np.pi*3*times)[:,None]
+    grid=np.arange(120)/100
+    output=buffered_playback(times,values,times+.01,ids,grid,100,.2)
+    np.testing.assert_allclose(output[20:120],values,atol=1e-10)
+    assert np.isnan(output[:20]).all()
+
+
+def test_legacy_diagnostic_translation_preserves_metrics_and_growth_counts():
+    from buffering import english_rows
+    case,trace=buffer_fixture(slow=True)
+    row=buffer_summary(case,trace,.5)
+    row['state']='fila crescente'
+    translated=english_rows([row])[0]
+    assert translated['state']=='growing queue'
+    assert row['state']=='fila crescente' # raw source metadata is left intact
+    assert translated['queue_slope_ms_s']==row['queue_slope_ms_s']
+    assert statistics([row])[0][0]['growing']==1
+
+
+def test_report_and_every_plot_label_are_english(tmp_path,monkeypatch):
+    import json
+    import buffering
+    from matplotlib.text import Text
+    labels=[]
+    def capture_labels(figure):
+        labels.extend(t.get_text() for t in figure.findobj(Text))
+        return 'data:image/png;base64,'
+    monkeypatch.setattr(buffering,'figure_data',capture_labels)
+    rows=[];traces={}
+    for slow,case_id in [(False,'B1'),(True,'B2')]:
+        case,trace=buffer_fixture(slow=slow)
+        case['case']=case_id
+        row=buffer_summary(case,trace,.5)
+        rows.append(row);traces[case_id]=trace
+    rows[-1]['state']='fila crescente'
+    cfg=json.loads(Path(__file__).with_name('config.json').read_text())['buffer_tests']
+    buffering.report(tmp_path,rows,traces,cfg)
+    markup=(tmp_path/'summary.html').read_text()
+    assert 'lang="en"' in markup
+    assert 'Statistical evidence and criteria' in markup
+    assert 'growing queue' in markup
+    assert 'Queue growth (ms per second)' in labels
+    assert 'Total delay p99 (ms)' in labels
+    for forbidden in ('aquisição','Atraso','Crescimento','fila crescente','execuções','amostras','Carga'):
+        assert forbidden not in markup
+        assert all(forbidden not in label for label in labels)
