@@ -1,9 +1,9 @@
 {
   "simulation": {
-    "duration_s": 5,
-    "repeats": 3,
-    "eeg_rates_hz": [500, 512, 731.5, 1000, 1500, 2048],
-    "eeg_channels": [16, 32, 64, 128],
+    "duration_s": 20,
+    "repeats": 10,
+    "eeg_rates_hz": [500, 512, 731.5, 1000, 2048],
+    "eeg_channels": [32, 64, 128],
     "sensors": [
       {"name": "eeg", "kind": "EEG", "rate": 512, "channels": 32},
       {"name": "emg", "kind": "EMG", "rate": 2000, "channels": 8},
