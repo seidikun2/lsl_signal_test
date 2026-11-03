@@ -12,6 +12,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly.graph_objects as go
+from plotly.offline import get_plotlyjs
+from plotly.subplots import make_subplots
 
 COLORS = {"A": "#c45a00", "B": "#7951b0", "C": "#008578"}
 
@@ -340,6 +343,11 @@ def marker_results(case):
             read_time_s=None,
             reference_matches=None,
             reference_timestamp=None,
+            received_marker_time_s=None,
+            marker_sent_at_s=None,
+            marker_delay_ms=None,
+            marker_after_send_ms=None,
+            marker_value_preserved=None,
         )
         if case["simulated"]:
             row["marker_time_s"] = float(stamp - case["source_start"])
@@ -350,6 +358,21 @@ def marker_results(case):
             row["marker_time_s"] = float(markers["corrected"][index] - case["start"])
         if received is not None:
             row["read_time_s"] = float(markers["received_at"][received] - case["start"])
+            row["received_marker_time_s"] = float(markers["corrected"][received] - case["start"])
+            row["marker_delay_ms"] = 1000 * (row["read_time_s"] - row["received_marker_time_s"])
+            if case["simulated"]:
+                row["marker_value_preserved"] = bool(
+                    np.array_equal(value, markers["values"][received])
+                )
+        if case["simulated"] and "sent_push_times" in markers:
+            row["marker_sent_at_s"] = float(
+                markers["sent_push_times"][index] - case["source_start"]
+            )
+            if received is not None:
+                pushed = markers["sent_push_times"][index] + markers["correction"][received]
+                row["marker_after_send_ms"] = float(
+                    (markers["received_at"][received] - pushed) * 1000
+                )
         rows.append(row)
     for received, reference in markers.get("pairs", np.empty((0, 2), dtype=int)):
         rows[received]["reference_matches"] = bool(
@@ -359,18 +382,214 @@ def marker_results(case):
     return rows
 
 
+def effect_results(case, name, stream, markers):
+    """Find waveform changes in the actual arrays, rather than assuming they arrived."""
+    if not case["simulated"] or "sent_values" not in stream:
+        return []
+    from transmission import AMPLITUDE, signal
+
+    sensor = dict(kind=stream["kind"], rate=stream["rate"], channels=1)
+    source_residual = stream["sent_values"][:, 0] - signal(sensor, stream["sent_index"])[:, 0]
+    received_residual = stream["values"][:, 0] - signal(sensor, stream["index"])[:, 0]
+    rows = []
+    for marker in markers:
+        event = next(
+            (
+                e
+                for e in case.get("events", [])
+                if e["label"] == marker["label"] and abs(e["time"] - marker["marker_time_s"]) < 1e-6
+            ),
+            None,
+        )
+        if event is None:
+            continue
+        row = dict(
+            marker,
+            signal=name,
+            source_effect_time_s=None,
+            received_effect_time_s=None,
+            effect_read_time_s=None,
+            source_marker_to_effect_ms=None,
+            received_marker_to_effect_ms=None,
+            added_sample_time_error_ms=None,
+            read_marker_to_effect_ms=None,
+            source_push_gap_ms=None,
+            added_arrival_gap_ms=None,
+            onset_sample_preserved=None,
+        )
+        detected = []
+        for times, residual in (
+            (stream["sent_counter"], source_residual),
+            (stream["counter"], received_residual),
+        ):
+            # Covers old recordings with a 200 ms effect, without moving that effect.
+            changed = (
+                (times >= event["time"] - 1e-9)
+                & (times < event["time"] + 0.5)
+                & (
+                    residual * np.sign(event["strength"])
+                    > abs(AMPLITUDE[stream["kind"]] * event["strength"]) / 2
+                )
+            )
+            found = np.flatnonzero(changed)
+            detected.append(int(found[0]) if len(found) else None)
+        sent, received = detected
+        if sent is not None:
+            row["onset_sample_preserved"] = False
+            row["source_effect_time_s"] = float(stream["sent_counter"][sent])
+            row["source_marker_to_effect_ms"] = 1000 * (
+                row["source_effect_time_s"] - row["marker_time_s"]
+            )
+            if marker["marker_sent_at_s"] is not None:
+                row["source_push_gap_ms"] = 1000 * (
+                    stream["sent_push_times"][sent]
+                    - case["source_start"]
+                    - marker["marker_sent_at_s"]
+                )
+        if received is not None:
+            row["received_effect_time_s"] = float(stream["corrected"][received] - case["start"])
+            row["effect_read_time_s"] = float(stream["received_at"][received] - case["start"])
+            if marker["received_marker_time_s"] is not None:
+                row["received_marker_to_effect_ms"] = 1000 * (
+                    row["received_effect_time_s"] - marker["received_marker_time_s"]
+                )
+                row["read_marker_to_effect_ms"] = 1000 * (
+                    row["effect_read_time_s"] - marker["read_time_s"]
+                )
+            if sent is not None:
+                row["onset_sample_preserved"] = bool(
+                    stream["sent_index"][sent] == stream["index"][received]
+                )
+        if (
+            row["onset_sample_preserved"]
+            and row["marker_value_preserved"]
+            and row["received_marker_to_effect_ms"] is not None
+            and row["source_marker_to_effect_ms"] is not None
+        ):
+            row["added_sample_time_error_ms"] = (
+                row["received_marker_to_effect_ms"] - row["source_marker_to_effect_ms"]
+            )
+        if (
+            row["onset_sample_preserved"]
+            and row["marker_value_preserved"]
+            and row["read_marker_to_effect_ms"] is not None
+            and row["source_push_gap_ms"] is not None
+        ):
+            row["added_arrival_gap_ms"] = (
+                row["read_marker_to_effect_ms"] - row["source_push_gap_ms"]
+            )
+        rows.append(row)
+    return rows
+
+
+def stream_offsets(events):
+    """Compare simultaneous sensor effects with EEG, removing native sample spacing."""
+    eeg = {(e["case"], e["marker_time_s"]): e for e in events if e["signal"] == "eeg"}
+    rows = []
+    for event in events:
+        reference = eeg.get((event["case"], event["marker_time_s"]))
+        if event["signal"] in ("eeg", "markers") or reference is None:
+            continue
+        row = dict(
+            case=event["case"],
+            signal=event["signal"],
+            label=event["label"],
+            marker_time_s=event["marker_time_s"],
+            source_vs_eeg_ms=None,
+            stored_vs_eeg_ms=None,
+            added_vs_eeg_ms=None,
+            added_arrival_vs_eeg_ms=None,
+        )
+        if (
+            event["source_effect_time_s"] is not None
+            and reference["source_effect_time_s"] is not None
+        ):
+            row["source_vs_eeg_ms"] = 1000 * (
+                event["source_effect_time_s"] - reference["source_effect_time_s"]
+            )
+        if (
+            event["received_effect_time_s"] is not None
+            and reference["received_effect_time_s"] is not None
+        ):
+            row["stored_vs_eeg_ms"] = 1000 * (
+                event["received_effect_time_s"] - reference["received_effect_time_s"]
+            )
+        preserved = event["onset_sample_preserved"] and reference["onset_sample_preserved"]
+        if (
+            preserved
+            and row["stored_vs_eeg_ms"] is not None
+            and row["source_vs_eeg_ms"] is not None
+        ):
+            row["added_vs_eeg_ms"] = row["stored_vs_eeg_ms"] - row["source_vs_eeg_ms"]
+        if (
+            preserved
+            and event["source_push_gap_ms"] is not None
+            and reference["source_push_gap_ms"] is not None
+        ):
+            row["added_arrival_vs_eeg_ms"] = 1000 * (
+                event["effect_read_time_s"] - reference["effect_read_time_s"]
+            ) - (event["source_push_gap_ms"] - reference["source_push_gap_ms"])
+        rows.append(row)
+    return rows
+
+
+def latency_series(case, stream):
+    """Clock-corrected sample age, and transport time where push times are known."""
+    reads = stream["received_at"] - case["start"]
+    sample_age = (stream["received_at"] - stream["corrected"]) * 1000
+    after_send = np.full(len(reads), np.nan)
+    if "sent_index" in stream:
+        _, sent, received = np.intersect1d(
+            stream["sent_index"], stream["index"], return_indices=True
+        )
+        pushed = stream["sent_push_times"][sent] + stream["correction"][received]
+        after_send[received] = (stream["received_at"][received] - pushed) * 1000
+    return reads, sample_age, after_send
+
+
+def latency_summary(times, values, prefix, unit="ms"):
+    valid = np.isfinite(times) & np.isfinite(values)
+    times, values = times[valid], values[valid]
+    result = {prefix + key + "_" + unit: None for key in ("p99", "max", "first", "last", "change")}
+    if len(values):
+        width = min(1.0, (times[-1] - times[0]) / 3)
+        first = float(np.median(values[times <= times[0] + width]))
+        last = float(np.median(values[times >= times[-1] - width]))
+        result.update(
+            {
+                prefix + "p99_" + unit: float(np.percentile(values, 99)),
+                prefix + "max_" + unit: float(np.max(values)),
+                prefix + "first_" + unit: first,
+                prefix + "last_" + unit: last,
+                prefix + "change_" + unit: last - first,
+            }
+        )
+    return result
+
+
+def delay_windows(times, values):
+    """One-second windows on the receiver clock; no fitted trend or clock repair."""
+    valid = np.isfinite(times) & np.isfinite(values)
+    times, values = times[valid], values[valid]
+    bins, first = np.unique(np.floor(times), return_index=True)
+    pieces = np.split(values, first[1:]) if len(values) else []
+    return (
+        bins + 0.5,
+        [float(np.median(p)) for p in pieces],
+        [float(np.percentile(p, 99)) for p in pieces],
+    )
+
+
 def measurements(case, name, stream):
     """Direct measurements only: values, missing samples and measured delay."""
-    times = stream["counter"] if case["simulated"] else stream["corrected"] - case["start"]
-    reads = stream["received_at"] - case["start"]
-    delay = (reads - times) * 1000
+    reads, delay, after_send = latency_series(case, stream)
     row = dict(
         case=case["id"],
         signal=name,
         status=case["status"],
         rate_hz=stream["rate"],
         channels=stream["channels"],
-        received=len(times),
+        received=len(reads),
         missing=None,
         value_difference=None,
         different_values=None,
@@ -382,10 +601,18 @@ def measurements(case, name, stream):
     )
     polls = stream["poll_times"]
     row["reading_hz"] = float((len(polls) - 1) / (polls[-1] - polls[0])) if len(polls) > 1 else None
-    if len(delay):
-        quarter = max(1, len(delay) // 4)
-        row["delay_p99_ms"] = float(np.percentile(delay, 99))
-        row["delay_change_ms"] = float(np.median(delay[-quarter:]) - np.median(delay[:quarter]))
+    row.update(latency_summary(reads, delay, "delay_"))
+    row.update(latency_summary(reads, after_send, "after_send_"))
+    checks = timestamp_checks(stream["timestamps"])
+    row["sample_clock_regular"] = not any(
+        checks[k] for k in ("repeated_times", "backward_steps", "invalid_times")
+    )
+    queue = stream.get("queue_samples", np.empty(0))
+    row["queue_max_samples"] = int(np.max(queue)) if len(queue) else None
+    row["queue_change_samples"] = None
+    if len(queue):
+        summary = latency_summary(polls, queue, "queue_", unit="samples")
+        row["queue_change_samples"] = summary["queue_change_samples"]
     if "sent_index" in stream:
         _, sent, received = np.intersect1d(
             stream["sent_index"], stream["index"], return_indices=True
@@ -393,12 +620,15 @@ def measurements(case, name, stream):
         row["missing"] = int(len(np.setdiff1d(stream["sent_index"], stream["index"])))
         expected, actual = stream["sent_values"][sent], stream["values"][received]
         if len(received):
-            push_times = stream["sent_push_times"][sent] - case["source_start"]
-            row["after_send_p99_ms"] = float(
-                np.percentile((reads[received] - push_times) * 1000, 99)
-            )
             counter_error = stream["counter"][received] - stream["sent_counter"][sent]
             row["counter_difference_ms"] = float(np.max(abs(counter_error)) * 1000)
+        row.update(
+            latency_summary(
+                stream["sent_counter"],
+                (stream["sent_push_times"] - stream["sent_timestamps"]) * 1000,
+                "before_send_",
+            )
+        )
     elif "pairs" in stream:
         received, reference = stream["pairs"].T
         row["missing"] = stream["missing_received"]
@@ -424,100 +654,245 @@ def image(fig):
 
 
 def signal_plot(case, name, stream, events):
-    fig, axes = plt.subplots(4, 1, figsize=(13, 11), constrained_layout=True)
-    times = stream["counter"] if case["simulated"] else stream["corrected"] - case["start"]
-    reads = stream["received_at"] - case["start"]
-    window = min(2.0, case["end"] - case["start"])
-    if "sent_values" in stream:
-        source_times, source_values = stream["sent_counter"], stream["sent_values"][:, 0]
-        axes[0].plot(source_times, source_values, label="Sent signal", lw=1.3)
-    elif "reference_values" in stream:
-        source_times = stream["reference_timestamps"] + stream["initial_offset"] - case["start"]
-        source_values = stream["reference_values"][:, 0]
-        visible = np.isfinite(source_times) & (source_times >= 0) & (source_times <= window)
-        axes[0].plot(source_times[visible], source_values[visible], label="Reference", lw=1.3)
-    else:
-        source_times, source_values = np.empty(0), np.empty(0)
-    value_times = (
-        stream["timestamps"] + stream["initial_offset"] - case["start"]
-        if "reference_values" in stream
-        else times
+    """All recorded points, first channel. One selected plot is rendered per section."""
+    fig = make_subplots(
+        rows=5,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.055,
+        row_heights=[0.25, 0.22, 0.23, 0.13, 0.17],
+        subplot_titles=(
+            "Sample values at their timestamps — channel 1 (held until next sample)",
+            "Latest value available at actual send / read time — channel 1",
+            "Latency over the recording",
+            "Samples waiting before each read",
+            "Markers and detected waveform changes",
+        ),
     )
+    # Keep these axes visible even in older files without queue snapshots or markers.
+    for row in (4, 5):
+        fig.add_trace(
+            go.Scatter(x=[0], y=[None], showlegend=False, hoverinfo="skip"), row=row, col=1
+        )
+
+    def trace(x, y, label, row, color, dash="solid", shape="linear", mode="lines", symbol="circle"):
+        fig.add_trace(
+            go.Scattergl(
+                x=np.asarray(x),
+                y=np.asarray(y),
+                name=label,
+                mode=mode,
+                line=dict(color=color, width=1.5, dash=dash, shape=shape),
+                marker=dict(color=color, size=9, symbol=symbol, line=dict(width=2)),
+                hovertemplate="%{x:.6f} s"
+                + ("<br>%{y:.5g}" if row != 5 else "")
+                + "<extra>%{fullData.name}</extra>",
+            ),
+            row=row,
+            col=1,
+        )
+
+    reads, age, after_send = latency_series(case, stream)
     values = stream["values"][:, 0].astype(float).copy()
-    if case["simulated"]:
-        gaps = np.diff(stream["index"]) != 1
-    elif stream["rate"] > 0:
-        gaps = np.diff(stream["timestamps"]) > 1.5 / stream["rate"]
-    else:
-        gaps = np.zeros(max(0, len(values) - 1), dtype=bool)
-    values[np.r_[False, gaps]] = np.nan
-    axes[0].plot(value_times, values, "--", label="Received signal", lw=1)
-    axes[0].set(title="All sample values — original sample times", ylabel="Value", xlim=(0, window))
-    grid = np.arange(int(window * 2048) + 1) / 2048
-    for t, values, label, style, repeated_ok in (
-        (source_times, source_values, "Sent / reference", "-", False),
-        (reads, stream["values"][:, 0], "Received", "--", True),
+    sample_times = stream["corrected"] - case["start"]
+    gaps = (
+        np.diff(stream["index"]) != 1
+        if case["simulated"]
+        else (
+            np.diff(stream["timestamps"]) > 1.5 / stream["rate"]
+            if stream["rate"]
+            else np.zeros(max(0, len(values) - 1), dtype=bool)
+        )
+    )
+    breaks = np.flatnonzero(gaps) + 1
+    value_times = np.insert(sample_times, breaks, np.nan)
+    values = np.insert(values, breaks, np.nan)
+    if "sent_values" in stream:
+        trace(
+            stream["sent_counter"],
+            stream["sent_values"][:, 0],
+            "Sent signal",
+            1,
+            "#2166ac",
+            shape="hv",
+        )
+        trace(
+            stream["sent_push_times"] - case["source_start"],
+            stream["sent_values"][:, 0],
+            "Sent — available",
+            2,
+            "#2166ac",
+            shape="hv",
+        )
+    trace(value_times, values, "Received signal", 1, "#d66000", "dash", "hv")
+    # A chunk shares one read time. Its last sample becomes the latest available value.
+    last = np.r_[np.diff(reads) != 0, True] if len(reads) else np.empty(0, dtype=bool)
+    trace(
+        reads[last], stream["values"][last, 0], "Received — available", 2, "#d66000", "dash", "hv"
+    )
+    trace(reads, age, "Sample → read", 3, "#93b7d5")
+    for series, label, color, dash in (
+        (age, "Sample → read", "#2166ac", "solid"),
+        (after_send, "Send call → read", "#b2182b", "dash"),
     ):
-        held = np.full(len(grid), np.nan)
-        if len(t):
-            # One pull can legitimately give several samples the same read time.
-            bad_steps = np.diff(t) < 0 if repeated_ok else np.diff(t) <= 0
-            if not np.isfinite(t).all() or np.any(bad_steps):
-                axes[1].text(
-                    0.02,
-                    0.95,
-                    f"{label}: live view unavailable (irregular sample times).",
-                    transform=axes[1].transAxes,
-                    va="top",
-                    fontsize=9,
+        if np.isfinite(series).any():
+            x, median, p99 = delay_windows(reads, series)
+            trace(x, median, label + " — median / second", 3, color, dash)
+            trace(x, p99, label + " — p99 / second", 3, color, "dot")
+    if "sent_push_times" in stream:
+        trace(
+            stream["sent_counter"],
+            (stream["sent_push_times"] - stream["sent_timestamps"]) * 1000,
+            "Sample → send call (sender wait)",
+            3,
+            "#888888",
+            "dot",
+        )
+    queue = stream.get("queue_samples", [])
+    if len(queue):
+        trace(stream["poll_times"] - case["start"], queue, "Waiting in this inlet", 4, "#008578")
+    else:
+        fig.add_annotation(
+            text="Not recorded in this file",
+            x=0.5,
+            y=0.5,
+            xref="x4 domain",
+            yref="y4 domain",
+            showarrow=False,
+        )
+
+    methods = [
+        ("marker_time_s", "Marker — source time", "circle"),
+        ("received_marker_time_s", "Marker — stored time", "circle-open"),
+        ("read_time_s", "Marker — read time", "diamond-open"),
+        ("source_effect_time_s", "Effect — sent sample", "triangle-up"),
+        ("received_effect_time_s", "Effect — stored sample", "triangle-up-open"),
+        ("effect_read_time_s", "Effect — read time", "square-open"),
+    ]
+    labels = list(dict.fromkeys(event["label"] for event in events))
+    for label in labels:
+        color = COLORS.get(label, "#555555")
+        selected = [e for e in events if e["label"] == label]
+        for field, caption, symbol in methods:
+            points = [e[field] for e in selected if e.get(field) is not None]
+            if points:
+                trace(
+                    points,
+                    [caption] * len(points),
+                    label + ": " + caption,
+                    5,
+                    color,
+                    mode="markers",
+                    symbol=symbol,
                 )
-                continue
-            indices = np.searchsorted(t, grid, side="right") - 1
-            present = indices >= 0
-            held[present] = values[indices[present]]
-            axes[1].step(grid, held, where="post", label=label, ls=style)
-    axes[1].set(
-        title="Live view at 2048 Hz — latest available value", ylabel="Value", xlim=(0, window)
-    )
-    axes[2].plot(times, (reads - times) * 1000, lw=0.8)
-    axes[2].set(
-        title="Python read time minus the recorded sample time",
-        ylabel="Delay (ms)",
-        xlabel="Time from shared start (s)",
-    )
-    selected = [event for event in events if event["signal"] in (name, "markers")]
-    labels = list(dict.fromkeys(event["label"] for event in selected))
-    for event in selected:
-        y, color = labels.index(event["label"]), COLORS.get(event["label"], "#245cb0")
-        for stamp, shift, style, fill in (
-            (event["marker_time_s"], 0.18, "-", color),
-            (event["read_time_s"], -0.18, "--", "white"),
-        ):
-            if stamp is not None:
-                axes[3].vlines(
-                    stamp, y + shift - 0.14, y + shift + 0.14, color=color, linestyles=style, lw=2.8
+        # Thick marker lines: same color, solid at source, dashed at reception.
+        finite_values = stream["values"][:, 0][np.isfinite(stream["values"][:, 0])]
+        if len(finite_values):
+            low, high = float(finite_values.min()), float(finite_values.max())
+            for field, row, dash in (("marker_time_s", 1, "solid"), ("read_time_s", 2, "dash")):
+                points = [e[field] for e in selected if e.get(field) is not None]
+                fig.add_trace(
+                    go.Scattergl(
+                        x=[v for t in points for v in (t, t, None)],
+                        y=[v for _ in points for v in (low, high, None)],
+                        name=label + " marker",
+                        showlegend=False,
+                        line=dict(color=color, width=3, dash=dash),
+                        hovertemplate=label + " marker<br>%{x:.6f} s<extra></extra>",
+                    ),
+                    row=row,
+                    col=1,
                 )
-                axes[3].plot(stamp, y + shift, "o", color=color, mfc=fill, ms=8, mew=2)
-                if 0 <= stamp <= window:
-                    axes[0 if style == "-" else 1].axvline(stamp, color=color, ls=style, lw=2)
-    axes[3].set_yticks(
-        [i + shift for i in range(len(labels)) for shift in (0.18, -0.18)],
-        [f"{label} — {kind}" for label in labels for kind in ("source", "received")],
+    fig.update_yaxes(title_text="Value", row=1, col=1)
+    fig.update_yaxes(title_text="Value", row=2, col=1)
+    fig.update_yaxes(title_text="Delay (ms)", row=3, col=1)
+    fig.update_yaxes(title_text="Samples", row=4, col=1, rangemode="tozero")
+    fig.update_yaxes(
+        type="category", categoryorder="array", categoryarray=[m[1] for m in methods], row=5, col=1
     )
-    axes[3].set(
-        title="Markers — solid / filled: marker time; dashed / hollow: Python read time.",
-        xlabel="Time from shared start (s)",
-        xlim=(0, window),
-        ylim=(-0.5, max(0.5, len(labels) - 0.5)),
+    duration = max(0.1, case["end"] - case["start"])
+    fig.update_xaxes(range=[0, duration], title_text="", showgrid=True)
+    fig.update_xaxes(title_text="Time from shared start (s)", row=5, col=1)
+    fig.update_layout(
+        template="plotly_white",
+        height=1300,
+        dragmode="zoom",
+        hovermode="closest",
+        title=f"{case['id']} / {name.upper()} — {stream['rate']:g} Hz, {stream['channels']} channels",
+        margin=dict(l=160, r=35, t=90, b=210),
+        legend=dict(orientation="h", y=-0.08),
+        font=dict(size=12),
     )
-    for ax in axes:
-        ax.grid(alpha=0.2)
-    for ax in axes[:2]:
-        ax.legend(fontsize=8)
-    fig.suptitle(
-        f"{case['id']} / {name.upper()} — {stream['rate']:g} Hz, {stream['channels']} channels"
+    return fig
+
+
+def interactive_view(identity, plots):
+    """Embed Plotly data without a server, CDN, or separate HTML assets."""
+    options = "".join(
+        f'<option value="{i}">{escape(p["label"])}</option>' for i, p in enumerate(plots)
     )
-    return image(fig)
+    payload = (
+        "["
+        + ",".join(
+            '{"figure":'
+            + plot["figure"].to_json()
+            + ',"events":'
+            + json.dumps(plot["events"])
+            + ',"summary":'
+            + json.dumps(plot["summary"])
+            + "}"
+            for plot in plots
+        )
+        + "]"
+    )
+    payload = payload.replace("</", "<\\/")
+    return f"""<div class="viewer" id="{identity}">
+<label>Recording / signal <select class="case-select">{options}</select></label>
+<label>Marker <select class="event-select"></select></label>
+<button class="reset" type="button">Full recording</button>
+<p>Drag to zoom; scroll to zoom; use the toolbar to pan or save an image. Double-click to reset.
+Click a legend item to hide or show it. All five time axes zoom together. All recorded points of channel 1 are included.</p>
+<div class="cards"></div><div class="chart"></div>
+<script type="application/json" class="plot-data">{payload}</script></div>"""
+
+
+INTERACTIVE_SCRIPT = r"""
+<script>
+for (const viewer of document.querySelectorAll('.viewer')) {
+  const plots = JSON.parse(viewer.querySelector('.plot-data').textContent);
+  const chart = viewer.querySelector('.chart');
+  const cases = viewer.querySelector('.case-select');
+  const markers = viewer.querySelector('.event-select');
+  const cards = viewer.querySelector('.cards');
+  const config = {responsive:true, scrollZoom:true, displaylogo:false};
+  function fullRange() {
+    const update = {};
+    for (let i = 1; i <= 5; i++) {
+      update['xaxis' + (i === 1 ? '' : i) + '.range'] = plots[cases.value].figure.layout.xaxis.range;
+      update['yaxis' + (i === 1 ? '' : i) + '.autorange'] = true;
+    }
+    Plotly.relayout(chart, update);
+  }
+  function show() {
+    const plot = plots[cases.value];
+    markers.replaceChildren(new Option('Choose a marker…', ''));
+    for (const event of plot.events) markers.add(new Option(event.label, event.time));
+    cards.innerHTML = plot.summary;
+    // Plotly mutates its input during zoom; keep the stored full extent intact.
+    Plotly.react(chart, plot.figure.data, structuredClone(plot.figure.layout), config);
+  }
+  cases.onchange = show;
+  markers.onchange = () => {
+    if (markers.value === '') return;
+    const t = Number(markers.value), update = {};
+    for (let i = 1; i <= 5; i++) update['xaxis' + (i === 1 ? '' : i) + '.range'] = [t - 0.08, t + 0.4];
+    Plotly.relayout(chart, update);
+  };
+  viewer.querySelector('.reset').onclick = fullRange;
+  show();
+}
+</script>
+"""
 
 
 def maps(rows, eeg):
@@ -606,16 +981,42 @@ def table(rows):
     return f'<div class="scroll"><table><tr>{header}</tr>{body}</table></div>'
 
 
+def selected_table(rows, columns):
+    return table([{label: row.get(field) for field, label in columns} for row in rows])
+
+
+def summary_cards(row):
+    cards = []
+    for title, field, unit in (
+        ("Sample → read: 99% ≤", "delay_p99_ms", "ms"),
+        ("Sample → read: end − start", "delay_change_ms", "ms"),
+        ("Send call → read: 99% ≤", "after_send_p99_ms", "ms"),
+        ("Send call → read: end − start", "after_send_change_ms", "ms"),
+        ("Most samples waiting", "queue_max_samples", "samples"),
+    ):
+        value = row.get(field)
+        shown = "Not measured" if value is None else f"{value:.3f} {unit}"
+        cards.append(f'<div class="card"><small>{title}</small><strong>{shown}</strong></div>')
+    note = (
+        ""
+        if row["sample_clock_regular"]
+        else "<p class=warning>Sample timestamps repeat or go backwards. Sample-to-read delay depends on those timestamps; it cannot establish buffer accumulation.</p>"
+    )
+    return "".join(cards) + note
+
+
 def write_report(output, cases):
     metrics, markers = [], []
     parts = [
         '<!doctype html><html lang="en"><meta charset="utf-8"><title>LSL results</title>',
-        "<style>body{font:16px system-ui;max-width:1300px;margin:30px auto;padding:20px}img{max-width:100%}section{margin:30px 0}table{border-collapse:collapse;font-size:13px}td,th{padding:8px;border-bottom:1px solid #ddd;text-align:left}.scroll{overflow:auto}summary{cursor:pointer;padding:8px}p{line-height:1.5}</style>",
-        "<h1>LSL — recorded results</h1><p>Original sample times and actual read times are kept separately. No curve alignment is applied. Simulated markers cause a waveform change 200 ms later; inspect the recorded waveforms directly.</p>",
+        "<meta name=viewport content='width=device-width, initial-scale=1'><style>body{font:16px system-ui;max-width:1400px;margin:20px auto;padding:20px;color:#163047}img{max-width:100%}section{margin:40px 0;border-top:2px solid #ddd}table{border-collapse:collapse;font-size:13px}td,th{padding:8px;border-bottom:1px solid #ddd;text-align:left}.scroll{overflow:auto}summary{cursor:pointer;padding:8px}p{line-height:1.5}select,button{font:inherit;padding:8px;margin:6px;max-width:100%}.cards{display:flex;gap:12px;flex-wrap:wrap}.card{background:#eef4f8;border-radius:8px;padding:14px;flex:1;min-width:180px}.card strong{display:block;margin-top:8px;font-size:21px}.warning{background:#fff0cb;padding:12px}</style>",
+        "<script>" + get_plotlyjs() + "</script>",
+        "<h1>LSL — recorded results</h1><p><b>Values preserved?</b> Check sample counts and value differences. <b>Arriving on time?</b> Check delay over time and samples waiting in the inlet. <b>Markers synchronized?</b> Zoom into a marker and compare the measured waveform changes. These are separate measurements.</p>",
+        "<p><b>Sample → read</b> is the age of a sample when Python reads it, using LSL clock correction. <b>Send call → read</b> starts at the sender's actual push call (simulation only). <b>End − start</b> compares median delays in the first and last second, shortened to one third of the recorded interval for brief captures. Positive means a larger delay at the end. The per-second curves show whether that increase persists or disappears.</p>",
     ]
     for group in dict.fromkeys(case["group"] for case in cases):
         parts.append(f"<section><h2>{escape(group)}</h2>")
-        figures, group_rows, group_events = [], [], []
+        plots, group_rows, group_events = [], [], []
         for case in (item for item in cases if item["group"] == group):
             events = marker_results(case)
             markers.extend(events)
@@ -627,14 +1028,37 @@ def write_report(output, cases):
                 row = measurements(case, name, stream)
                 row["stream_count"] = count
                 group_rows.append(row)
+                effects = effect_results(case, name, stream, events)
+                markers.extend(effects)
+                group_events.extend(effects)
                 if len(stream["values"]):
-                    figures.append(
-                        f'<details><summary>{escape(case["id"] + " / " + name)} — {stream["rate"]:g} Hz</summary><img loading="lazy" src="{signal_plot(case, name, stream, events)}"></details>'
+                    plotted_events = effects if case["simulated"] else events
+                    jumps = []
+                    for event in plotted_events:
+                        for field, caption in (
+                            ("marker_time_s", "source"),
+                            ("read_time_s", "read"),
+                        ):
+                            if event.get(field) is not None:
+                                t = event[field]
+                                jumps.append(
+                                    dict(label=f"{event['label']} — {caption} {t:.6f} s", time=t)
+                                )
+                    plots.append(
+                        dict(
+                            label=f"{case['id']} / {name.upper()} — {stream['rate']:g} Hz",
+                            figure=signal_plot(case, name, stream, plotted_events),
+                            events=jumps,
+                            summary=summary_cards(row),
+                        )
                     )
             if case.get("reference_note"):
                 parts.append(f'<p>{escape(case["reference_note"])}</p>')
             if case.get("timestamp_checks"):
-                parts.append("<h3>Original timestamp checks</h3>" + table(case["timestamp_checks"]))
+                parts.append(
+                    "<details><summary>XDF coverage and original timestamp checks</summary><h3>Original timestamp checks</h3>"
+                    + table(case["timestamp_checks"])
+                )
                 coverage = [
                     dict(
                         signal=name,
@@ -654,6 +1078,7 @@ def write_report(output, cases):
                     if "comparison_info" in stream
                 )
                 parts.extend(f"<p>{escape(note)}</p>" for note in notes)
+                parts.append("</details>")
             if case["error"]:
                 parts.append(f'<p>{escape(case["id"] + ": " + case["error"])}</p>')
         metrics.extend(group_rows)
@@ -696,17 +1121,104 @@ def write_report(output, cases):
         parts.extend(
             [
                 "<h3>Recorded signals</h3>",
-                *figures,
-                "<h3>Measurements</h3>",
+                (
+                    interactive_view(f"viewer-{len(metrics)}", plots)
+                    if plots
+                    else "<p>No signal recorded.</p>"
+                ),
+                "<h3>1. Sample values — every channel</h3>",
+                selected_table(
+                    group_rows,
+                    [
+                        ("case", "Recording"),
+                        ("signal", "Signal"),
+                        ("rate_hz", "Rate (Hz)"),
+                        ("channels", "Channels"),
+                        ("received", "Received"),
+                        ("missing", "Without a match"),
+                        ("different_values", "Changed values"),
+                        ("value_difference", "Largest difference"),
+                    ],
+                ),
+                "<h3>2. Arrival delay</h3>",
+                selected_table(
+                    group_rows,
+                    [
+                        ("case", "Recording"),
+                        ("signal", "Signal"),
+                        ("delay_first_ms", "Start median (ms)"),
+                        ("delay_last_ms", "End median (ms)"),
+                        ("delay_change_ms", "End − start (ms)"),
+                        ("delay_max_ms", "Largest delay (ms)"),
+                        ("after_send_p99_ms", "Send → read p99 (ms)"),
+                        ("after_send_change_ms", "Send → read change (ms)"),
+                        ("queue_max_samples", "Most waiting samples"),
+                    ],
+                ),
+                "<p>Each buffer point is a snapshot before a read, for this inlet only. Rising delay together with rising waiting counts supports accumulation here. Delay alone does not identify its cause. Unmeasured fields are shown as —. No acceptable latency limit has been assumed.</p>",
+                "<h3>3. Marker and waveform timing</h3>",
+                (
+                    "<p>New simulations publish each marker before activating its waveform change. Each sensor changes at its first available sample; different sampling rates have different time steps. The report detects changes in the saved sent and received values of channel 1. Older recordings keep their original effect timing.</p>"
+                    if group != "Real EEG"
+                    else "<p>Real markers are shown at their corrected timestamp and actual Python read time. No artificial effect is added to real EEG. Amplifier send-call times and physical stimulus onset are not available from these recordings.</p>"
+                ),
+                (
+                    selected_table(
+                        [e for e in group_events if e["signal"] != "markers"],
+                        [
+                            ("case", "Recording"),
+                            ("signal", "Signal"),
+                            ("label", "Marker"),
+                            ("marker_time_s", "Marker time (s)"),
+                            ("source_marker_to_effect_ms", "Sent marker → change (ms)"),
+                            ("received_marker_to_effect_ms", "Stored marker → change (ms)"),
+                            ("added_sample_time_error_ms", "Added stored-time error (ms)"),
+                            ("read_marker_to_effect_ms", "Read marker → change (ms)"),
+                            ("added_arrival_gap_ms", "Added arrival gap (ms)"),
+                            ("onset_sample_preserved", "First changed sample preserved"),
+                        ],
+                    )
+                    if group != "Real EEG"
+                    else selected_table(
+                        group_events,
+                        [
+                            ("label", "Marker"),
+                            ("marker_time_s", "Marker timestamp (s)"),
+                            ("read_time_s", "Python read time (s)"),
+                            ("marker_delay_ms", "Marker delay (ms)"),
+                        ],
+                    )
+                ),
+                (
+                    "<h4>Other sensors relative to simultaneous EEG</h4><p>The sent offset includes each sensor's native sample spacing. Added stored-time error subtracts that offset. Added arrival gap subtracts the source push-call gap. Positive means this sensor was later than EEG.</p>"
+                    + selected_table(
+                        stream_offsets(group_events),
+                        [
+                            ("case", "Recording"),
+                            ("signal", "Signal"),
+                            ("label", "Marker"),
+                            ("marker_time_s", "Marker time (s)"),
+                            ("source_vs_eeg_ms", "Sent offset (ms)"),
+                            ("stored_vs_eeg_ms", "Stored offset (ms)"),
+                            ("added_vs_eeg_ms", "Added stored-time error (ms)"),
+                            ("added_arrival_vs_eeg_ms", "Added arrival gap (ms)"),
+                        ],
+                    )
+                    if group == "Additional streams"
+                    else ""
+                ),
+                "<details><summary>All measurements — also saved in metrics.csv</summary>",
                 table(group_rows),
+                "</details>",
                 "<details><summary>Marker times — every event</summary>",
                 table(group_events),
                 "</details></section>",
             ]
         )
     parts.append(
-        "<p>p99: 99% of samples had a delay at or below this value. Delay change compares the last and first quarter of the recording. Zero value difference applies only to matched samples; ambiguous samples remain unverified. Gray means no measurement. Different sampling rates need not be integer multiples. Buffers hold data; timestamps and clock correction place samples in time.</p><p>XDF comparison uses original source timestamps within 1 microsecond. Equal repeated-time blocks are compared in recorded order; partial, unequal or conflicting blocks are marked ambiguous. Lookup indices do not reorder the original signals. When clocks go backwards, unmatched counts remain unknown rather than treating a clock reversal as loss. Unmatched samples are not proof of loss. Repeated or backward sample times also affect the delay curve; they do not prove that a buffer is filling. Real EEG contains no artificial response. This checks LSL transport and storage, not physical stimulus onset.</p></html>"
+        "<p>p99 means 99% of measured delays are at or below that value. Send and read times bracket software calls, not a physical transmission measurement; clock-correction uncertainty remains. A read marker → change gap can be negative when Python reads the EEG chunk first. Added arrival gap subtracts the measured source push-call gap. A preserved first changed sample is required to interpret an effect-onset difference as timing alone.</p><details><summary>XDF comparison and timing limits</summary><p>Zero value difference applies only to matched samples; ambiguous samples remain unverified. XDF comparison uses original source timestamps within 1 microsecond. Equal repeated-time blocks are compared in recorded order; partial, unequal or conflicting blocks are ambiguous. Original signals are never reordered or repaired. Backward clocks leave unmatched counts unknown. Unmatched samples are not proof of loss. Repeated or backward source times make sample-age curves unreliable as evidence of delay accumulation. Real EEG contains no artificial response: two LSL recordings cannot establish physical stimulus or amplifier timing.</p></details>"
     )
+    parts.append(INTERACTIVE_SCRIPT + "</html>")
     write_csv(output / "metrics.csv", metrics)
     write_csv(output / "markers.csv", markers)
     (output / "summary.html").write_text("\n".join(parts), encoding="utf-8")

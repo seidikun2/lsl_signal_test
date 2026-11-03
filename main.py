@@ -61,6 +61,8 @@ def simulate(sensors, duration, receiver):
             with np.load(source, allow_pickle=False) as saved:
                 case["source_start"] = float(saved["start"])
                 case["events"] = json.loads(str(saved["events"]))
+                case["effect_delay_s"] = float(saved["effect_delay_s"])
+                case["effect_width_s"] = float(saved["effect_width_s"])
                 case["start"] = case["source_start"] + case["streams"]["eeg"]["initial_offset"]
                 for key in saved.files:
                     if "__" in key:
@@ -81,12 +83,16 @@ def main():
         "--compare-eeg", metavar="RECORDING", help="Compare a recordings.npz with XDF"
     )
     mode.add_argument("--list-streams", action="store_true", help="Show available LSL outlets")
+    mode.add_argument("--report", metavar="RECORDING", help="Rebuild a report from recordings.npz")
     parser.add_argument("--reference", help="Simultaneous LabRecorder XDF file")
     args = parser.parse_args()
     if bool(args.compare_eeg) != bool(args.reference):
         parser.error("Use --compare-eeg and --reference together")
     if args.list_streams:
         reception.list_streams()
+        return
+    if args.report:
+        analysis.write_report(Path(args.report).parent, analysis.load_recordings(args.report))
         return
     if args.compare_eeg:
         cases = analysis.load_recordings(args.compare_eeg)

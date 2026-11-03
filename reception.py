@@ -40,7 +40,13 @@ def record(specifications, duration, receiver, ready=None):
     """One reading loop serves every stream, including streams with different rates."""
     simulated = ready is not None
     inlets, streams, buffers, offsets = {}, {}, {}, {}
-    case = {"simulated": simulated, "status": "completed", "error": "", "streams": streams}
+    case = {
+        "simulated": simulated,
+        "status": "completed",
+        "error": "",
+        "streams": streams,
+        "receiver": dict(receiver),
+    }
     try:
         for spec in specifications:
             found = resolve_byprop("name", spec["stream_name"], timeout=10)
@@ -78,6 +84,7 @@ def record(specifications, duration, receiver, ready=None):
                     "received_at",
                     "correction",
                     "poll_times",
+                    "queue_samples",
                 )
             }
             if simulated and name != "markers":
@@ -109,6 +116,7 @@ def record(specifications, duration, receiver, ready=None):
                     refresh = local_clock() + 2
                 for name, inlet in inlets.items():
                     buffers[name]["poll_times"].append(local_clock())
+                    buffers[name]["queue_samples"].append(inlet.samples_available())
                     values, timestamps = inlet.pull_chunk(timeout=0, max_samples=4096)
                     received = local_clock()
                     if not timestamps:
@@ -150,7 +158,7 @@ def record(specifications, duration, receiver, ready=None):
                 pass  # Closing a connection must not prevent saving its data.
     for name, fields in buffers.items():
         for key, pieces in fields.items():
-            if key == "poll_times":
+            if key in ("poll_times", "queue_samples"):
                 streams[name][key] = np.asarray(pieces)
             elif pieces:
                 streams[name][key] = np.concatenate(pieces)

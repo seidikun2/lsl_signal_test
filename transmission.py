@@ -6,7 +6,7 @@ import time
 import numpy as np
 from pylsl import StreamInfo, StreamOutlet, local_clock
 
-EFFECT_DELAY = 0.2
+EFFECT_DELAY = 0.0
 EFFECT_WIDTH = 0.08
 AMPLITUDE = {"EEG": 60.0, "EMG": 140.0, "IMU": 3.0}
 
@@ -70,7 +70,8 @@ def send(sensors, duration, identity, ready, finished, destination):
     schedule = [{"label": "start", "time": 0}] + events + [{"label": "end", "time": duration}]
     next_sample = {sensor["name"]: 0 for sensor in sensors}
     marker_index = 0
-    marker_times, marker_values = [], []
+    marker_times, marker_values, marker_push_times = [], [], []
+    active_events = []
     try:
         while not finished.is_set():
             due = [
@@ -82,22 +83,27 @@ def send(sensors, duration, identity, ready, finished, destination):
                 due.append((schedule[marker_index]["time"], None))
             if not due:
                 break
-            counter, sensor = min(due, key=lambda item: item[0])
+            # Publish the marker before any sample at the same scheduled time.
+            counter, sensor = min(due, key=lambda item: (item[0], item[1] is not None))
             stamp = start + counter
             time.sleep(max(0, stamp - local_clock()))
             if sensor is None:
-                label = schedule[marker_index]["label"]
+                event = schedule[marker_index]
+                label = event["label"]
+                marker_push_times.append(local_clock())
                 markers.push_sample([label], timestamp=stamp)
                 marker_times.append(stamp)
                 marker_values.append([label])
+                if "strength" in event:
+                    active_events.append(event)
                 marker_index += 1
                 continue
             name = sensor["name"]
             index = next_sample[name]
-            values = signal(sensor, [index], events)[0]
-            pushed = local_clock()
+            values = signal(sensor, [index], active_events)[0]
             # Only simulated packets add these two verification channels.
             packet = [*values.tolist(), index, counter]
+            pushed = local_clock()
             outlets[name].push_sample(packet, timestamp=stamp)
             for key, value in zip(saved[name], (values, stamp, pushed, index, counter)):
                 saved[name][key].append(value)
@@ -115,7 +121,10 @@ def send(sensors, duration, identity, ready, finished, destination):
     arrays.update(
         start=np.array(start),
         events=np.array(json.dumps(events)),
+        effect_delay_s=np.array(EFFECT_DELAY),
+        effect_width_s=np.array(EFFECT_WIDTH),
         markers__timestamps=np.asarray(marker_times),
+        markers__push_times=np.asarray(marker_push_times),
         markers__values=np.asarray(marker_values, dtype=str).reshape(-1, 1),
     )
     np.savez_compressed(destination, **arrays)
