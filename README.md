@@ -53,6 +53,18 @@ markers in the shared recording range. It does not shift curves, resample or
 change units. Real EEG receives no artificial response. This checks two LSL
 recordings; a physical stimulus-onset check needs a recorded trigger or sensor.
 
+Repeated or backward timestamps no longer stop the report. The terminal and
+report identify which recording contains them. Equal repeated-time blocks can
+be compared in their recorded sample order. Unequal blocks, partial EEG blocks
+at capture edges and conflicting clock matches are marked **ambiguous**, not
+counted as proven loss. No timestamps or source arrays are changed. The report
+shows how many samples were actually compared; zero value difference applies
+only to those matched samples. A clock going backwards also affects the delay
+curve, so it is not proof that the receiving buffer is filling. Missing counts
+remain unknown in that case. The matched-value plot uses recorded sample order,
+not reconstructed time; a source live view is omitted when its times repeat or
+go backwards. No new capture is needed to inspect these checks.
+
 ## Results
 
 Open **`results/summary.html`**, or **`results-real/summary.html`** for real EEG.
